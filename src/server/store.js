@@ -1,5 +1,6 @@
 import { mkdir } from 'node:fs/promises'
 import { dirname } from 'node:path'
+import { randomUUID } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
 
 const MAX_TEXT_LENGTH = 8_000
@@ -10,6 +11,7 @@ export class AtlasStore {
     if (typeof dataFile !== 'string' || dataFile.length === 0) throw new Error('atlas: config.dataFile must be a non-empty path')
     this.dataFile = dataFile
     this.db = undefined
+    this.undoOperations = new Map()
     this.ready = this.open()
   }
 
@@ -56,6 +58,15 @@ export class AtlasStore {
         y INTEGER NOT NULL,
         updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS atlas_hidden_card (
+        card_id TEXT PRIMARY KEY,
+        hidden_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS atlas_card_parent_override (
+        card_id TEXT PRIMARY KEY,
+        parent_card_id TEXT,
+        updated_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS atlas_pending_tool (
         session_id TEXT NOT NULL REFERENCES atlas_node(session_id) ON DELETE CASCADE,
         call_id TEXT NOT NULL,
@@ -68,7 +79,7 @@ export class AtlasStore {
       CREATE INDEX IF NOT EXISTS atlas_node_cwd_idx ON atlas_node(cwd, updated_at DESC);
       CREATE INDEX IF NOT EXISTS atlas_message_session_idx ON atlas_message(session_id, source_seq);
       INSERT OR IGNORE INTO atlas_meta(key, value) VALUES ('schema_version', '1');
-      UPDATE atlas_meta SET value = '2' WHERE key = 'schema_version';
+      UPDATE atlas_meta SET value = '3' WHERE key = 'schema_version';
     `)
   }
 
@@ -140,7 +151,10 @@ export class AtlasStore {
       const anchor = parentCards.filter(item => item.sourceSeq === null || card.seedLength === null || item.sourceSeq < card.seedLength).at(-1)
       card.parentCardId = anchor?.id ?? lastCardBySession.get(card.parentSessionId)
     }
-    return { cards, workspaces: this.workspaceSummaries(nodes.map(toNode)) }
+    const hiddenCards = new Set(this.db.prepare('SELECT card_id FROM atlas_hidden_card').all().map(row => row.card_id))
+    const parentOverrides = new Map(this.db.prepare('SELECT card_id, parent_card_id FROM atlas_card_parent_override').all().map(row => [row.card_id, row.parent_card_id]))
+    for (const card of cards) if (parentOverrides.has(card.id)) card.parentCardId = parentOverrides.get(card.id) ?? undefined
+    return { cards: cards.filter(card => !hiddenCards.has(card.id)), workspaces: this.workspaceSummaries(nodes.map(toNode)) }
   }
 
   sessionCard(node, messages, turn, parentCardId, positions) {
@@ -174,16 +188,20 @@ export class AtlasStore {
   async detail(sessionId) {
     await this.ready
     const node = this.node(sessionId)
-    const messages = this.db.prepare('SELECT source_seq, kind, text, turn_number, step_number, process_json, at FROM atlas_message WHERE session_id = ? ORDER BY source_seq').all(sessionId).map(row => ({
-      sourceSeq: row.source_seq,
-      kind: row.kind,
-      text: row.text,
-      turn: row.turn_number,
-      step: row.step_number,
-      process: row.process_json === null ? [] : JSON.parse(row.process_json),
-      at: row.at,
-    }))
+    const messages = this.db.prepare('SELECT source_seq, kind, text, turn_number, step_number, process_json, at FROM atlas_message WHERE session_id = ? ORDER BY source_seq').all(sessionId).map(toMessage)
     return { node: toNode(node), messages }
+  }
+
+  async cardDetail(cardId) {
+    await this.ready
+    const parsed = parseCardId(cardId)
+    const node = this.node(parsed.sessionId)
+    if (parsed.sourceSeq === null) return this.detail(parsed.sessionId)
+    const next = this.db.prepare('SELECT source_seq FROM atlas_message WHERE session_id = ? AND kind = ? AND source_seq > ? ORDER BY source_seq LIMIT 1').get(parsed.sessionId, 'user', parsed.sourceSeq)
+    const rows = next === undefined
+      ? this.db.prepare('SELECT source_seq, kind, text, turn_number, step_number, process_json, at FROM atlas_message WHERE session_id = ? AND source_seq >= ? ORDER BY source_seq').all(parsed.sessionId, parsed.sourceSeq)
+      : this.db.prepare('SELECT source_seq, kind, text, turn_number, step_number, process_json, at FROM atlas_message WHERE session_id = ? AND source_seq >= ? AND source_seq < ? ORDER BY source_seq').all(parsed.sessionId, parsed.sourceSeq, next.source_seq)
+    return { node: toNode(node), messages: rows.map(toMessage) }
   }
 
   async setPosition(sessionId, position) {
@@ -216,6 +234,81 @@ export class AtlasStore {
     if (changed === 0) throw new AtlasNotFoundError('对话卡片不存在')
     const update = this.db.prepare('UPDATE atlas_node SET hidden = 1, updated_at = ? WHERE session_id = ?')
     for (const row of descendants.slice(1)) update.run(now(), row.session_id)
+  }
+
+  async deleteCard(cardId, mode = 'single', successorCardId = undefined) {
+    await this.ready
+    if (mode !== 'single' && mode !== 'subtree') throw new AtlasInputError('删除模式无效')
+    const { cards } = await this.conversationCards()
+    const target = cards.find(card => card.id === cardId)
+    if (target === undefined) throw new AtlasNotFoundError('对话卡片不存在')
+    const children = new Map()
+    for (const card of cards) if (card.parentCardId) children.set(card.parentCardId, [...(children.get(card.parentCardId) ?? []), card])
+    const descendants = []
+    const queue = [target]
+    const seen = new Set()
+    while (queue.length > 0) {
+      const card = queue.shift()
+      if (seen.has(card.id)) continue
+      seen.add(card.id); descendants.push(card)
+      if (mode === 'subtree') queue.push(...(children.get(card.id) ?? []))
+    }
+    const directChildren = mode === 'single' ? children.get(target.id) ?? [] : []
+    const promotedRoot = mode === 'single' && !target.parentCardId && directChildren.length > 0
+      ? directChildren.find(card => card.sessionId === target.sessionId) ?? directChildren.find(card => card.id === successorCardId)
+      : undefined
+    if (mode === 'single' && !target.parentCardId && directChildren.length > 1 && promotedRoot === undefined) throw new AtlasInputError('请选择新的起始节点')
+    const previousOverrides = directChildren.map(card => {
+      const row = this.db.prepare('SELECT parent_card_id FROM atlas_card_parent_override WHERE card_id = ?').get(card.id)
+      return { cardId: card.id, existed: row !== undefined, parentCardId: row?.parent_card_id ?? null }
+    })
+    const operationId = randomUUID()
+    const timestamp = now()
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const hide = this.db.prepare('INSERT OR REPLACE INTO atlas_hidden_card(card_id, hidden_at) VALUES (?, ?)')
+      for (const card of descendants) hide.run(card.id, timestamp)
+      if (mode === 'single') {
+        const reparent = this.db.prepare('INSERT INTO atlas_card_parent_override(card_id, parent_card_id, updated_at) VALUES (?, ?, ?) ON CONFLICT(card_id) DO UPDATE SET parent_card_id = excluded.parent_card_id, updated_at = excluded.updated_at')
+        for (const child of directChildren) reparent.run(child.id, target.parentCardId ?? (child.id === promotedRoot?.id ? null : promotedRoot?.id ?? null), timestamp)
+      }
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+    this.undoOperations.set(operationId, { hiddenCardIds: descendants.map(card => card.id), previousOverrides, createdAt: Date.now() })
+    for (const [id, operation] of this.undoOperations) if (Date.now() - operation.createdAt > 5 * 60_000) this.undoOperations.delete(id)
+    return {
+      operationId,
+      mode,
+      deletedCount: descendants.length,
+      branchCount: new Set(descendants.filter(card => card.parentSessionId !== null).map(card => card.sessionId)).size,
+      reconnectedCount: directChildren.length,
+    }
+  }
+
+  async undoDelete(operationId) {
+    await this.ready
+    const operation = this.undoOperations.get(operationId)
+    if (operation === undefined) throw new AtlasNotFoundError('撤销操作已过期')
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const reveal = this.db.prepare('DELETE FROM atlas_hidden_card WHERE card_id = ?')
+      for (const cardId of operation.hiddenCardIds) reveal.run(cardId)
+      const removeOverride = this.db.prepare('DELETE FROM atlas_card_parent_override WHERE card_id = ?')
+      const restoreOverride = this.db.prepare('INSERT INTO atlas_card_parent_override(card_id, parent_card_id, updated_at) VALUES (?, ?, ?) ON CONFLICT(card_id) DO UPDATE SET parent_card_id = excluded.parent_card_id, updated_at = excluded.updated_at')
+      for (const item of operation.previousOverrides) {
+        if (item.existed) restoreOverride.run(item.cardId, item.parentCardId, now())
+        else removeOverride.run(item.cardId)
+      }
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+    this.undoOperations.delete(operationId)
+    return { restoredCount: operation.hiddenCardIds.length }
   }
 
   async syncSessions(sessions, removedSessionIds = []) {
@@ -311,7 +404,8 @@ export class AtlasStore {
   foldToolEvent(sessionId, event) {
     const callId = String(event.type === 'tool/call' ? event.data?.callId ?? '' : event.data?.message?.source?.callId ?? '')
     if (callId === '') return
-    const target = this.db.prepare('SELECT source_seq, process_json FROM atlas_message WHERE session_id = ? AND kind = ? AND turn_number IS ? AND step_number IS ? ORDER BY source_seq DESC LIMIT 1').get(sessionId, 'assistant', event.data?.turn ?? null, event.data?.step ?? null)
+    const exact = this.db.prepare('SELECT source_seq, process_json FROM atlas_message WHERE session_id = ? AND kind = ? AND turn_number IS ? AND step_number IS ? ORDER BY source_seq DESC LIMIT 1').get(sessionId, 'assistant', event.data?.turn ?? null, event.data?.step ?? null)
+    const target = exact ?? this.db.prepare('SELECT source_seq, process_json FROM atlas_message WHERE session_id = ? AND kind = ? AND turn_number IS ? ORDER BY source_seq DESC LIMIT 1').get(sessionId, 'assistant', event.data?.turn ?? null)
     if (target === undefined) return this.rememberPendingTool(sessionId, event, callId)
     const process = JSON.parse(target.process_json ?? '[]')
     const entry = process.find(item => item.callId === callId)
@@ -322,12 +416,14 @@ export class AtlasStore {
         entry.arguments = String(event.data?.arguments ?? entry.arguments ?? '')
       }
     } else if (entry === undefined) {
-      process.push({ callId, name: '工具调用', arguments: null, result: contentText(event.data?.message?.content), error: event.data?.error ? `${event.data.error.name}: ${event.data.error.code}` : null })
+      process.push({ callId, name: '工具调用', arguments: null, result: contentText(event.data?.message?.content), meta: toolPresentationMeta(event.data?.message), error: event.data?.error ? `${event.data.error.name}: ${event.data.error.code}` : null })
     } else {
       entry.result = contentText(event.data?.message?.content)
+      entry.meta = toolPresentationMeta(event.data?.message) ?? entry.meta
       entry.error = event.data?.error ? `${event.data.error.name}: ${event.data.error.code}` : null
     }
     this.db.prepare('UPDATE atlas_message SET process_json = ? WHERE session_id = ? AND source_seq = ?').run(JSON.stringify(process), sessionId, target.source_seq)
+    this.dedupeToolCall(sessionId, callId, target.source_seq)
   }
 
   rememberPendingTool(sessionId, event, callId) {
@@ -338,6 +434,7 @@ export class AtlasStore {
       entry.arguments = String(event.data?.arguments ?? '')
     } else {
       entry.result = contentText(event.data?.message?.content)
+      entry.meta = toolPresentationMeta(event.data?.message) ?? entry.meta
       entry.error = event.data?.error ? `${event.data.error.name}: ${event.data.error.code}` : null
     }
     this.db.prepare(`INSERT INTO atlas_pending_tool(session_id, call_id, turn_number, step_number, payload_json, updated_at)
@@ -347,7 +444,7 @@ export class AtlasStore {
   }
 
   attachPendingTools(sessionId, turn, step, sourceSeq) {
-    const rows = this.db.prepare('SELECT call_id, payload_json FROM atlas_pending_tool WHERE session_id = ? AND turn_number IS ? AND step_number IS ? ORDER BY updated_at').all(sessionId, turn, step)
+    const rows = this.db.prepare('SELECT call_id, payload_json FROM atlas_pending_tool WHERE session_id = ? AND turn_number IS ? ORDER BY updated_at').all(sessionId, turn)
     if (rows.length === 0) return
     const target = this.db.prepare('SELECT process_json FROM atlas_message WHERE session_id = ? AND source_seq = ?').get(sessionId, sourceSeq)
     if (target === undefined) return
@@ -360,6 +457,17 @@ export class AtlasStore {
       this.db.prepare('DELETE FROM atlas_pending_tool WHERE session_id = ? AND call_id = ?').run(sessionId, row.call_id)
     }
     this.db.prepare('UPDATE atlas_message SET process_json = ? WHERE session_id = ? AND source_seq = ?').run(JSON.stringify(process), sessionId, sourceSeq)
+    for (const row of rows) this.dedupeToolCall(sessionId, row.call_id, sourceSeq)
+  }
+
+  dedupeToolCall(sessionId, callId, keepSourceSeq) {
+    const rows = this.db.prepare('SELECT source_seq, process_json FROM atlas_message WHERE session_id = ? AND kind = ? AND source_seq <> ? AND process_json IS NOT NULL').all(sessionId, 'assistant', keepSourceSeq)
+    const update = this.db.prepare('UPDATE atlas_message SET process_json = ? WHERE session_id = ? AND source_seq = ?')
+    for (const row of rows) {
+      const process = JSON.parse(row.process_json ?? '[]')
+      const filtered = process.filter(item => item.callId !== callId)
+      if (filtered.length !== process.length) update.run(JSON.stringify(filtered), sessionId, row.source_seq)
+    }
   }
 
   replaceTasks(sessionId, event) {
@@ -399,6 +507,27 @@ function projectable(event) {
 
 function note(kind, text, turn, step) { const normalized = String(text ?? '').trim(); return normalized === '' ? null : { kind, text: normalized.slice(0, MAX_TEXT_LENGTH), turn: Number.isSafeInteger(turn) ? turn : null, step: Number.isSafeInteger(step) ? step : null } }
 function contentText(content) { return Array.isArray(content) ? content.flatMap(block => block?.type === 'text' ? [block.text] : block?.type === 'tool-result' ? [contentText(block.content)] : []).filter(value => typeof value === 'string' && value.trim() !== '').join('\n') : '' }
+function toolPresentationMeta(message) {
+  const direct = message?.meta ?? message?.presentationMeta
+  if (direct && typeof direct === 'object' && !Array.isArray(direct)) return direct
+  const visit = content => {
+    if (!Array.isArray(content)) return null
+    for (const block of content) {
+      const meta = block?.meta ?? block?.presentationMeta
+      if (meta && typeof meta === 'object' && !Array.isArray(meta)) return meta
+      const nested = visit(block?.content)
+      if (nested !== null) return nested
+    }
+    return null
+  }
+  return visit(message?.content)
+}
+function parseCardId(cardId) {
+  const turn = /^(.*):turn:(\d+)$/.exec(cardId)
+  if (turn !== null) return { sessionId: turn[1], sourceSeq: Number(turn[2]) }
+  const session = /^(.*):session$/.exec(cardId)
+  return { sessionId: session?.[1] ?? cardId, sourceSeq: null }
+}
 function runtimeContext(text) { return text.trimStart().startsWith('Current runtime context. This snapshot supersedes earlier runtime-context snapshots.') }
 function sessionCwd(session) { const cwd = session?.header?.meta?.cwd ?? session?.header?.cwd; return typeof cwd === 'string' && cwd.trim() !== '' ? cwd : '未指定工作目录' }
 function titleOf(value, fallback) { return typeof value === 'string' && value.trim() !== '' ? value.trim().slice(0, MAX_TITLE_LENGTH) : fallback }

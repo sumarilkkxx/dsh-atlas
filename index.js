@@ -53,11 +53,15 @@ export function apply(ctx, config = {}) {
       if (path === '/atlas/api/workspaces' && req.method === 'GET') return sendJson(res, 200, { workspaces: (await store.graph()).workspaces })
       if (path === '/atlas/api/sessions/sync' && req.method === 'POST') { const body = await readJson(req); return sendJson(res, 200, await store.syncSessions(body.sessions, body.removedSessionIds)) }
       const detail = /^\/atlas\/api\/cards\/([^/]+)$/.exec(path)
-      if (detail !== null && req.method === 'GET') return sendJson(res, 200, await store.detail(sessionIdForCard(decodeURIComponent(detail[1]))))
+      if (detail !== null && req.method === 'GET') return sendJson(res, 200, await store.cardDetail(decodeURIComponent(detail[1])))
       const position = /^\/atlas\/api\/cards\/([^/]+)\/position$/.exec(path)
       if (position !== null && req.method === 'PATCH') { const id = decodeURIComponent(position[1]); const body = await readJson(req); return sendJson(res, 200, { position: id.includes(':') ? await store.setCardPosition(id, body.position) : await store.setPosition(id, body.position) }) }
       const hide = /^\/atlas\/api\/cards\/([^/]+)\/hide$/.exec(path)
       if (hide !== null && req.method === 'POST') { await store.hide(sessionIdForCard(decodeURIComponent(hide[1]))); return sendJson(res, 204) }
+      const remove = /^\/atlas\/api\/cards\/([^/]+)\/delete$/.exec(path)
+      if (remove !== null && req.method === 'POST') { const body = await readJson(req); return sendJson(res, 200, await store.deleteCard(decodeURIComponent(remove[1]), body.mode, body.successorCardId)) }
+      const undoDelete = /^\/atlas\/api\/deletions\/([^/]+)\/undo$/.exec(path)
+      if (undoDelete !== null && req.method === 'POST') return sendJson(res, 200, await store.undoDelete(decodeURIComponent(undoDelete[1])))
       const rename = /^\/atlas\/api\/cards\/([^/]+)\/title$/.exec(path)
       if (rename !== null && req.method === 'PATCH') { await store.rename(sessionIdForCard(decodeURIComponent(rename[1])), (await readJson(req)).title); return sendJson(res, 204) }
       return sendJson(res, 404, { error: '接口不存在' })
@@ -74,6 +78,7 @@ export function apply(ctx, config = {}) {
   ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/atlas/', handler: async (_req, res) => sendFile(res, 'text/html; charset=utf-8', await page()) }), 'atlas: page')
   ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/atlas/assets/atlas.js', handler: async (_req, res) => sendFile(res, 'text/javascript; charset=utf-8', await asset('assets/atlas.js')) }), 'atlas: app')
   ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/atlas/assets/style.css', handler: async (_req, res) => sendFile(res, 'text/css; charset=utf-8', await asset('assets/style.css')) }), 'atlas: styles')
+  ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/atlas/assets/three.min.js', handler: async (_req, res) => sendFile(res, 'text/javascript; charset=utf-8', await asset('three.min.js')) }), 'atlas: legacy three renderer')
   ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: '/atlas/api', handler: api }), 'atlas: api')
 }
 
