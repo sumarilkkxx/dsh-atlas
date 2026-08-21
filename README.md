@@ -115,15 +115,6 @@ dsh plugin --profile web add link:D:\path\to\dsh-atlas
 dsh web
 ```
 
-### Desktop 内置 CLI
-
-如果 DeepSeek Harness Desktop 没有把 `dsh` 加入 `PATH`，可以调用桌面应用内置 CLI。请将路径替换为实际安装位置：
-
-```powershell
-node "D:\DeepSeek Harness\resources\host\node_modules\@deepseek-ai\dsh\lib\bin.js" plugin --profile web add "github:sumarilkkxx/dsh-atlas"
-node "D:\DeepSeek Harness\resources\host\node_modules\@deepseek-ai\dsh\lib\bin.js" web
-```
-
 ## 使用方式
 
 1. 在 DSH 中打开任意已有会话。
