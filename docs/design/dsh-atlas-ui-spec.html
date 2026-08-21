@@ -1,0 +1,368 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DSH Atlas UI 组件规范</title>
+  <style>
+    /* ─────────────────────────────────────────────────────────────────────────
+     * design-systems/notion/tokens.css
+     *
+     * Structured token bindings for the "Notion" brand — the all-in-one
+     * workspace's warm minimalism translated into the shared schema.
+     *
+     * Brand identity in three sentences:
+     *   1. Warm neutrals throughout — grays carry yellow-brown undertones
+     *      (#f6f5f4, #31302e, #615d59, #a39e98); pure white canvas with
+     *      near-black text (rgba(0,0,0,0.95)) that softens imperceptibly.
+     *   2. NotionInter (modified Inter) with aggressive negative
+     *      letter-spacing at display sizes (-2.125px at 64px), four
+     *      weights (400/500/600/700), OpenType "lnum"+"locl" at display.
+     *   3. Whisper borders (1px rgba(0,0,0,0.1)) and multi-layer shadows
+     *      with sub-0.05 opacity — depth felt rather than seen.
+     *
+     * Schema decisions:
+     *   - --bg binds to pure white; --surface to warm white (#f6f5f4).
+     *   - --surface-warm aliases --surface (same warm white tier).
+     *   - --fg binds to rgba(0,0,0,0.95) — the signature near-black.
+     *   - --fg-2 binds to #31302e (warm dark) for headings on surfaces.
+     *   - --accent is Notion Blue (#0075de) — the only saturated color.
+     *   - --tracking-display: -0.033em (-2.125px / 64px normalized).
+     *   - --elev-raised is the 4-layer multi-layer card shadow with max
+     *     opacity 0.04 — felt-not-seen Notion depth.
+     *   - --radius-sm: 4px (buttons/inputs); --radius-md: 8px (cards).
+     * ─────────────────────────────────────────────────────────────────── */
+
+    :root {
+      /* ─── Surface ──────────────────────────────────────────────────── */
+      --bg:           #ffffff;
+      --surface:      #f6f5f4;               /* warm white — section alternation */
+      --surface-warm: var(--surface);        /* aliases to warm white tier */
+
+      /* ─── Foreground ───────────────────────────────────────────────── */
+      --fg:   rgba(0, 0, 0, 0.95);           /* near-black — primary text */
+      --fg-2: #31302e;                       /* warm dark — headings on surfaces */
+      --muted: #615d59;                      /* warm gray 500 — secondary text */
+      --meta:  #a39e98;                      /* warm gray 300 — placeholder/captions */
+
+      /* ─── Border ───────────────────────────────────────────────────── */
+      --border:      rgba(0, 0, 0, 0.1);    /* whisper border — standard */
+      --border-soft: rgba(0, 0, 0, 0.06);  /* subtler row dividers */
+
+      /* ─── Accent ───────────────────────────────────────────────────── */
+      --accent:        #0075de;             /* Notion Blue — links, primary CTAs */
+      --accent-on:     #ffffff;
+      --accent-hover:  #005bab;             /* Active Blue — pressed state */
+      --accent-active: color-mix(in oklab, var(--accent), black 14%);
+
+      /* ─── Semantic ─────────────────────────────────────────────────── */
+      --success: #1aae39;                   /* Notion green — confirmation */
+      --warn:    #dd5b00;                   /* Notion orange — warning */
+      --danger:  #dc2626;
+
+      /* ─── Typography ───────────────────────────────────────────────── */
+      --font-display: "NotionInter", "Inter", -apple-system, system-ui, "Segoe UI", Helvetica, Arial, sans-serif;
+      --font-body:    "NotionInter", "Inter", -apple-system, system-ui, "Segoe UI", Helvetica, Arial, sans-serif;
+      --font-mono:    ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Monaco, Consolas, monospace;
+
+      /* Type scale — DESIGN.md §Typography Hierarchy.
+       * Notion's display range 64px→12px; the 8 schema slots map to the
+       * spine. 54px secondary-hero sits between --text-4xl and --text-3xl
+       * and appears inline in components.html where needed. */
+      --text-xs:   12px;                    /* badge / micro label */
+      --text-sm:   14px;                    /* caption / footer */
+      --text-base: 16px;                    /* body */
+      --text-lg:   20px;                    /* body large — introductions */
+      --text-xl:   26px;                    /* sub-heading */
+      --text-2xl:  40px;                    /* sub-heading large */
+      --text-3xl:  48px;                    /* section heading */
+      --text-4xl:  64px;                    /* display hero */
+
+      /* Leading + tracking.
+       * --leading-tight=1.00: max compression at 64px display.
+       * h2 (48px) → 1.00; h3 (40px) → 1.50 per DESIGN.md §Typography.
+       * --tracking-display: -0.033em = -2.125px / 64px normalized. */
+      --leading-body:     1.5;
+      --leading-tight:    1.00;
+      --tracking-display: -0.033em;
+
+      /* ─── Spacing ──────────────────────────────────────────────────── */
+      --space-1:  4px;
+      --space-2:  8px;
+      --space-3:  12px;
+      --space-4:  16px;
+      --space-5:  20px;
+      --space-6:  24px;
+      --space-8:  32px;
+      --space-12: 48px;
+
+      /* Section rhythm — DESIGN.md §Responsive Behavior. */
+      --section-y-desktop: 80px;
+      --section-y-tablet:  48px;
+      --section-y-phone:   32px;
+
+      /* ─── Radius ───────────────────────────────────────────────────── */
+      /* Micro 4px for buttons/inputs; standard 12px for cards; pill for
+         badges. --radius-md maps to 8px (small cards, containers). */
+      --radius-sm:   4px;
+      --radius-md:   8px;
+      --radius-lg:   12px;
+      --radius-pill: 9999px;
+
+      /* ─── Elevation ────────────────────────────────────────────────── */
+      /* Multi-layer stack: individual opacity never > 0.04.
+         Depth felt rather than seen — the Notion shadow philosophy. */
+      --elev-flat:   none;
+      --elev-ring:   0 0 0 1px var(--border);
+      --elev-raised:
+        rgba(0, 0, 0, 0.04) 0px 4px 18px,
+        rgba(0, 0, 0, 0.027) 0px 2px 7.85px,
+        rgba(0, 0, 0, 0.02) 0px 0.8px 2.93px,
+        rgba(0, 0, 0, 0.01) 0px 0.175px 1.04px;
+
+      /* ─── Focus ────────────────────────────────────────────────────── */
+      /* 2px solid outline + shadow reinforcement per DESIGN.md §8. */
+      --focus-ring: 0 0 0 3px rgba(9, 127, 232, 0.3);
+
+      /* ─── Motion ───────────────────────────────────────────────────── */
+      --motion-fast:   150ms;
+      --motion-base:   200ms;
+      --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+
+      /* ─── Layout ───────────────────────────────────────────────────── */
+      --container-max:            1200px;
+      --container-gutter-desktop: 24px;
+      --container-gutter-tablet:  16px;
+      --container-gutter-phone:   12px;
+    }
+
+    *,*::before,*::after{box-sizing:border-box} html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
+    body{margin:0;background:var(--bg);color:var(--fg);font:400 var(--text-base)/var(--leading-body) var(--font-body);text-rendering:optimizeLegibility}
+    button,input,select,textarea{font:inherit} button,[role="button"]{cursor:pointer} a{color:inherit;text-decoration:none} p{text-wrap:pretty}
+    h1,h2,h3{margin:0;font-family:var(--font-display);text-wrap:balance;font-feature-settings:"lnum","locl"}
+    :focus-visible{outline:2px solid var(--accent);outline-offset:3px;box-shadow:var(--focus-ring)}
+    .container{width:min(100%,var(--container-max));margin-inline:auto;padding-inline:var(--container-gutter-desktop)}
+    .section{padding-block:var(--section-y-desktop)} .section+.section{border-top:1px solid var(--border-soft)} .section-warm{background:var(--surface)}
+    .stack{display:flex;flex-direction:column;gap:var(--space-5)} .row-between{display:flex;align-items:center;justify-content:space-between;gap:var(--space-4)}
+    .grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--space-6)}
+    .grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:var(--space-6)}
+    .grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:var(--space-4)}
+    .grid-2-1{display:grid;grid-template-columns:2fr 1fr;gap:var(--space-12);align-items:start}
+    .topnav{position:sticky;top:0;z-index:20;background:color-mix(in oklch,var(--bg) 94%,transparent);border-bottom:1px solid var(--border);backdrop-filter:blur(12px)}
+    .topnav-inner{min-height:64px;display:flex;align-items:center;justify-content:space-between;gap:var(--space-5)}
+    .logo{display:inline-flex;align-items:center;gap:var(--space-2);font-size:var(--text-base);font-weight:700;letter-spacing:-.02em}
+    .logo-mark{width:30px;height:30px;display:grid;place-items:center;border:1px solid var(--border);border-radius:var(--radius-md);background:var(--fg);color:var(--bg)}
+    .topnav nav{display:flex;align-items:center;gap:var(--space-6)} .topnav nav a{min-height:44px;display:inline-flex;align-items:center;color:var(--muted);font-size:var(--text-sm);font-weight:500}
+    .topnav nav a:hover{color:var(--fg);text-decoration:underline;text-underline-offset:5px}
+    .hero{padding-block:clamp(72px,10vw,128px)} .hero-center{max-width:820px;margin-inline:auto;text-align:center}
+    .eyebrow{margin:0 0 var(--space-5);color:var(--accent);font:600 var(--text-xs)/1.33 var(--font-mono);letter-spacing:.08em;text-transform:uppercase}
+    h1{font-size:clamp(42px,6vw,var(--text-4xl));line-height:var(--leading-tight);letter-spacing:var(--tracking-display)}
+    h2{font-size:clamp(32px,4vw,var(--text-3xl));line-height:1.04;letter-spacing:-.031em} h3{font-size:var(--text-lg);line-height:1.3;letter-spacing:-.012em}
+    .lead{max-width:62ch;margin:var(--space-5) auto 0;color:var(--muted);font-size:var(--text-lg);line-height:1.45}
+    .hero-cta{margin-top:var(--space-8);display:flex;justify-content:center;gap:var(--space-3);flex-wrap:wrap}
+    .btn{min-height:44px;display:inline-flex;align-items:center;justify-content:center;gap:var(--space-2);padding:var(--space-2) var(--space-4);border:1px solid transparent;border-radius:var(--radius-sm);background:transparent;color:var(--fg);font-size:15px;font-weight:600;transition:background var(--motion-fast) var(--ease-standard),border-color var(--motion-fast) var(--ease-standard),transform var(--motion-fast) var(--ease-standard)}
+    .btn:hover{background:color-mix(in oklch,var(--fg) 6%,transparent)} .btn:active{transform:translateY(1px)}
+    .btn-primary{background:var(--accent);color:var(--accent-on)} .btn-primary:hover{background:var(--accent-hover);color:var(--accent-on)}
+    .btn-outline{border-color:var(--border);background:var(--bg)} .btn-outline:hover{border-color:color-mix(in oklch,var(--fg) 28%,transparent);background:var(--surface)}
+    .btn-ghost{padding-inline:var(--space-2)} .btn-icon{width:44px;padding:0}.btn svg{width:17px;height:17px}
+    .card{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-lg);padding:var(--space-6);box-shadow:var(--elev-flat);transition:border-color var(--motion-base) var(--ease-standard),box-shadow var(--motion-base) var(--ease-standard),transform var(--motion-base) var(--ease-standard)}
+    .card:hover{border-color:color-mix(in oklch,var(--fg) 22%,transparent);box-shadow:var(--elev-raised)}
+    .pill{display:inline-flex;align-items:center;gap:var(--space-1);min-height:24px;padding:var(--space-1) var(--space-2);border-radius:var(--radius-pill);background:var(--surface);color:var(--muted);font:600 var(--text-xs)/1.33 var(--font-body)}
+    .pill-blue{background:color-mix(in oklch,var(--accent) 8%,var(--bg));color:var(--accent)}
+    .pill-success{background:color-mix(in oklch,var(--success) 8%,var(--bg));color:color-mix(in oklch,var(--success) 76%,var(--fg))}
+    .pill-warn{background:color-mix(in oklch,var(--warn) 8%,var(--bg));color:color-mix(in oklch,var(--warn) 76%,var(--fg))}
+    .meta{color:var(--muted);font:400 var(--text-xs)/1.4 var(--font-mono)}
+    .section-head{max-width:680px;margin-bottom:var(--space-12)} .section-head p:not(.eyebrow){margin:var(--space-4) 0 0;color:var(--muted)}
+    .swatch{min-height:132px;display:flex;flex-direction:column;justify-content:space-between}
+    .swatch-tone{height:54px;margin:calc(var(--space-6)*-1) calc(var(--space-6)*-1) var(--space-5);border-radius:var(--radius-lg) var(--radius-lg) 0 0;border-bottom:1px solid var(--border-soft)}
+    .tone-bg{background:var(--bg)}.tone-surface{background:var(--surface)}.tone-fg{background:var(--fg)}.tone-accent{background:var(--accent)}
+    .control-board{display:grid;gap:var(--space-6)} .control-line{display:grid;grid-template-columns:150px minmax(0,1fr);gap:var(--space-6);align-items:start;padding-block:var(--space-5);border-top:1px solid var(--border-soft)}
+    .control-label{color:var(--muted);font:500 var(--text-sm)/1.5 var(--font-mono)} .control-demo{display:flex;align-items:center;gap:var(--space-3);flex-wrap:wrap}
+    .field{display:grid;gap:var(--space-2);width:min(100%,360px)} .field label{font-size:var(--text-sm);font-weight:600}
+    .input{width:100%;min-height:44px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg);color:var(--fg);padding:var(--space-2) var(--space-3)}
+    .input::placeholder{color:var(--meta)}.input:focus{outline:2px solid var(--accent);outline-offset:1px;box-shadow:var(--focus-ring);border-color:var(--accent)}
+    .segmented{display:inline-flex;gap:var(--space-1);padding:var(--space-1);border:1px solid var(--border);border-radius:var(--radius-md);background:var(--surface)}
+    .segmented button{min-height:36px;border:0;border-radius:var(--radius-sm);background:transparent;color:var(--muted);padding:0 var(--space-3);font-size:var(--text-sm);font-weight:600}
+    .segmented button[aria-selected="true"]{background:var(--bg);color:var(--fg);box-shadow:var(--elev-ring)}
+    .atlas-canvas{position:relative;min-height:600px;overflow:hidden;border:1px solid var(--border);border-radius:var(--radius-lg);background-color:var(--surface);background-image:radial-gradient(var(--border) 1px,transparent 1px);background-size:22px 22px}
+    .canvas-toolbar{position:absolute;inset:var(--space-4) var(--space-4) auto;z-index:3;display:flex;justify-content:space-between;align-items:center;gap:var(--space-4)}
+    .canvas-title{border:1px solid var(--border);border-radius:var(--radius-md);background:color-mix(in oklch,var(--bg) 92%,transparent);padding:var(--space-2) var(--space-3);box-shadow:var(--elev-raised);backdrop-filter:blur(10px)}
+    .canvas-title strong{display:block;font-size:var(--text-sm)}.canvas-title span{color:var(--muted);font-size:var(--text-xs)}
+    .conversation-card{position:absolute;width:300px;min-height:176px;display:flex;flex-direction:column;border:1px solid var(--border);border-radius:var(--radius-lg);background:var(--bg);padding:var(--space-4);box-shadow:var(--elev-raised);transition:border-color var(--motion-base) var(--ease-standard),transform var(--motion-base) var(--ease-standard)}
+    .conversation-card:hover{transform:translateY(-2px);border-color:color-mix(in oklch,var(--fg) 24%,transparent)}
+    .conversation-card.is-current{border-color:var(--accent);box-shadow:var(--focus-ring),var(--elev-raised)}
+    .conversation-card.is-branch{border-style:dashed;border-color:color-mix(in oklch,var(--warn) 48%,var(--border))}
+    .conversation-card.is-streaming::after{content:"";position:absolute;inset:auto 0 0;height:3px;border-radius:0 0 var(--radius-lg) var(--radius-lg);background:var(--success);transform-origin:left;animation:stream 1.8s var(--ease-standard) infinite}
+    .card-one{left:6%;top:112px}.card-two{left:38%;top:112px}.card-three{right:5%;top:330px}
+    .conversation-card header,.conversation-card footer{display:flex;align-items:center;justify-content:space-between;gap:var(--space-2)}
+    .conversation-card h3{margin-top:var(--space-4);font-size:var(--text-base)}.conversation-card p{margin:var(--space-2) 0 var(--space-5);color:var(--muted);font-size:var(--text-sm);line-height:1.55}
+    .conversation-card footer{margin-top:auto;padding-top:var(--space-3);border-top:1px solid var(--border-soft);color:var(--muted);font-size:var(--text-xs)}
+    .icon-actions{display:flex;gap:var(--space-1)}.icon-actions button{width:36px;height:36px;display:grid;place-items:center;border:0;border-radius:var(--radius-sm);background:transparent;color:var(--muted)}
+    .icon-actions button:hover{background:var(--surface);color:var(--fg)}.icon-actions svg{width:16px;height:16px}
+    .connector{position:absolute;height:1px;background:var(--border);transform-origin:left}.connector-main{width:90px;left:31%;top:206px}.connector-branch{width:150px;left:62%;top:257px;transform:rotate(35deg);background:color-mix(in oklch,var(--warn) 42%,var(--border))}
+    @keyframes stream{0%{transform:scaleX(.12);opacity:.45}55%{transform:scaleX(.76);opacity:1}100%{transform:scaleX(1);opacity:.2}}
+    .anatomy-list{display:grid;gap:0}.anatomy-row{display:grid;grid-template-columns:44px 150px 1fr;gap:var(--space-4);align-items:start;padding:var(--space-4) 0;border-top:1px solid var(--border-soft)}
+    .anatomy-row b{width:28px;height:28px;display:grid;place-items:center;border:1px solid var(--border);border-radius:50%;font:600 var(--text-xs)/1 var(--font-mono)}
+    .anatomy-row strong{font-size:var(--text-sm)}.anatomy-row span{color:var(--muted);font-size:var(--text-sm)}
+    .tool-run{overflow:hidden;padding:0}.tool-run summary{min-height:48px;display:flex;align-items:center;justify-content:space-between;gap:var(--space-3);padding:var(--space-3) var(--space-4);cursor:pointer;font-size:var(--text-sm);font-weight:600;list-style:none}
+    .tool-run summary::-webkit-details-marker{display:none}.tool-run pre{margin:0;padding:var(--space-4);border-top:1px solid var(--border-soft);background:var(--surface);color:var(--fg-2);font:400 var(--text-xs)/1.6 var(--font-mono);white-space:pre-wrap}
+    .ds-table-wrap{overflow-x:auto}.ds-table{width:100%;border-collapse:collapse;font-size:var(--text-sm)}.ds-table th,.ds-table td{padding:var(--space-4);border-bottom:1px solid var(--border);text-align:left;vertical-align:top}
+    .ds-table th{color:var(--muted);font:600 var(--text-xs)/1.4 var(--font-mono);letter-spacing:.05em;text-transform:uppercase}.ds-table tbody tr:hover{background:color-mix(in oklch,var(--fg) 4%,transparent)}.ds-table code{font-family:var(--font-mono);font-size:var(--text-xs)}
+    .dialog{width:min(680px,calc(100vw - 32px));max-height:min(720px,calc(100vh - 32px));border:1px solid var(--border);border-radius:var(--radius-lg);background:var(--bg);color:var(--fg);padding:0;box-shadow:var(--elev-raised)}
+    .dialog::backdrop{background:color-mix(in oklch,var(--fg) 30%,transparent);backdrop-filter:blur(2px)}.dialog-head{display:flex;align-items:start;justify-content:space-between;gap:var(--space-4);padding:var(--space-6);border-bottom:1px solid var(--border-soft)}
+    .dialog-head p{margin:var(--space-2) 0 0;color:var(--muted);font-size:var(--text-sm)}.dialog-body{display:grid;gap:var(--space-4);padding:var(--space-6)}
+    .message-block{border-left:2px solid var(--border);padding-left:var(--space-4)}.message-block strong{font-size:var(--text-xs)}.message-block p{margin:var(--space-1) 0 0;color:var(--muted);font-size:var(--text-sm)}
+    .dialog-foot{display:flex;justify-content:flex-end;gap:var(--space-2);padding:var(--space-4) var(--space-6);border-top:1px solid var(--border-soft)}
+    .pagefoot{padding-block:var(--space-8);border-top:1px solid var(--border);color:var(--muted);font-size:var(--text-sm)}
+    .toast{position:fixed;right:var(--space-6);bottom:var(--space-6);z-index:50;max-width:360px;display:none;align-items:start;gap:var(--space-3);border:1px solid var(--border);border-radius:var(--radius-md);background:var(--fg-2);color:var(--bg);padding:var(--space-3) var(--space-4);box-shadow:var(--elev-raised);font-size:var(--text-sm)}.toast.is-visible{display:flex}
+    @media(max-width:920px){.container{padding-inline:var(--container-gutter-tablet)}.section{padding-block:var(--section-y-tablet)}.grid-2,.grid-3,.grid-4,.grid-2-1{grid-template-columns:1fr}.topnav nav{display:none}.control-line{grid-template-columns:1fr;gap:var(--space-3)}.atlas-canvas{min-height:auto;display:grid;gap:var(--space-4);padding:80px var(--space-4) var(--space-4);background-image:none}.conversation-card{position:relative;inset:auto;width:100%}.connector{display:none}}
+    @media(max-width:600px){.container{padding-inline:var(--container-gutter-phone)}.section{padding-block:var(--section-y-phone)}h1{font-size:40px}.topnav-inner{min-height:58px}.topnav .btn{min-height:40px}.anatomy-row{grid-template-columns:36px 1fr}.anatomy-row span{grid-column:2}.toast{right:var(--space-3);bottom:var(--space-3);left:var(--space-3)}}
+    @media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}
+  </style>
+</head>
+<body>
+  <header class="topnav" data-od-id="top-navigation">
+    <div class="container topnav-inner">
+      <a class="logo" href="#overview" data-od-id="brand-link"><span class="logo-mark">A</span><span>DSH Atlas · UI 规范</span></a>
+      <nav aria-label="规范章节"><a href="#foundation">基础</a><a href="#components">基础组件</a><a href="#cards">对话卡片</a><a href="#mapping">组件映射</a></nav>
+      <button class="btn btn-outline" id="copyGuideline" data-od-id="copy-guideline-button">复制实施摘要</button>
+    </div>
+  </header>
+  <main id="content">
+    <section class="section hero" id="overview" data-od-id="overview-section">
+      <div class="container hero-center">
+        <p class="eyebrow">DSH ATLAS · UI 规范 1.0</p>
+        <h1 data-od-id="overview-title">让长对话，变成清晰可操作的卡片。</h1>
+        <p class="lead">基于 shadcn/ui 的通用能力，建立专属于 Atlas 的卡片、分支、工具过程与来源追踪规则。</p>
+        <div class="hero-cta"><button class="btn btn-primary" id="openDemo" data-od-id="open-card-demo-button">查看卡片详情示例</button><a class="btn btn-ghost" href="#mapping" data-od-id="view-mapping-link">查看组件映射 →</a></div>
+      </div>
+    </section>
+    <section class="section section-warm" id="foundation" data-od-id="foundation-section">
+      <div class="container">
+        <div class="section-head"><p class="eyebrow">01 · FOUNDATION</p><h2 data-od-id="foundation-title">基础层先统一，再扩展领域组件。</h2><p>统一暖中性色、轻边框、4px 控件圆角与 12px 卡片圆角。蓝色只承担当前状态、焦点和主操作，不作为装饰。</p></div>
+        <div class="grid-4" aria-label="核心颜色令牌">
+          <article class="card swatch" data-od-id="token-background"><div class="swatch-tone tone-bg"></div><strong>背景</strong><span class="meta">--bg · 主画布与弹窗</span></article>
+          <article class="card swatch" data-od-id="token-surface"><div class="swatch-tone tone-surface"></div><strong>表面</strong><span class="meta">--surface · 侧栏与分区</span></article>
+          <article class="card swatch" data-od-id="token-foreground"><div class="swatch-tone tone-fg"></div><strong>前景</strong><span class="meta">--fg · 文本与深色控件</span></article>
+          <article class="card swatch" data-od-id="token-accent"><div class="swatch-tone tone-accent"></div><strong>强调</strong><span class="meta">--accent · 当前与焦点</span></article>
+        </div>
+        <div class="grid-3" style="margin-top:var(--space-6)">
+          <article class="card" data-od-id="typography-rule"><span class="meta">排版</span><h3 style="margin-top:var(--space-3)">紧凑标题，舒展正文</h3><p style="color:var(--muted);margin-bottom:0">16px 正文，14px 卡片摘要，12px 元信息；代码、时间和计数使用等宽字体。</p></article>
+          <article class="card" data-od-id="spacing-rule"><span class="meta">间距</span><h3 style="margin-top:var(--space-3)">8px 节奏，少量 12px 微调</h3><p style="color:var(--muted);margin-bottom:0">控件高度不低于 44px；卡片内边距 16px，弹窗与规范面板使用 24px。</p></article>
+          <article class="card" data-od-id="elevation-rule"><span class="meta">层级</span><h3 style="margin-top:var(--space-3)">边框定义结构，阴影表达浮层</h3><p style="color:var(--muted);margin-bottom:0">普通卡片保持扁平；拖动、悬停、弹窗和浮动工具条才出现柔和阴影。</p></article>
+        </div>
+      </div>
+    </section>
+    <section class="section" id="components" data-od-id="base-components-section">
+      <div class="container grid-2-1">
+        <div>
+          <div class="section-head"><p class="eyebrow">02 · SHADCN PRIMITIVES</p><h2 data-od-id="base-components-title">通用组件只做一件事。</h2><p>保留 shadcn/ui 的可访问性与组合方式，Atlas 只统一视觉变量、尺寸和文案行为。</p></div>
+          <div class="control-board">
+            <div class="control-line"><span class="control-label">Button</span><div class="control-demo"><button class="btn btn-primary" data-od-id="button-primary">创建分支</button><button class="btn btn-outline" data-od-id="button-outline">在 DSH 中打开</button><button class="btn btn-ghost" data-od-id="button-ghost">归档</button></div></div>
+            <div class="control-line"><span class="control-label">Badge</span><div class="control-demo"><span class="pill">对话</span><span class="pill pill-blue">当前</span><span class="pill pill-success">已完成</span><span class="pill pill-warn">待验证</span></div></div>
+            <div class="control-line"><span class="control-label">Tabs</span><div class="segmented" role="tablist" aria-label="视图示例"><button role="tab" aria-selected="true">卡片视图</button><button role="tab" aria-selected="false">待办</button><button role="tab" aria-selected="false">文件关联</button></div></div>
+            <div class="control-line"><span class="control-label">Input</span><div class="field"><label for="sampleSearch">搜索对话</label><input class="input" id="sampleSearch" placeholder="标题、内容、工具或待办" /></div></div>
+          </div>
+        </div>
+        <aside class="card" data-od-id="component-rules-panel">
+          <span class="meta">组件约束</span>
+          <div class="anatomy-list" style="margin-top:var(--space-4)">
+            <div class="anatomy-row"><b>1</b><strong>一个主操作</strong><span>同一视口最多一个实心按钮，其余使用描边或文字按钮。</span></div>
+            <div class="anatomy-row"><b>2</b><strong>状态不只靠颜色</strong><span>当前、分支、失败同时使用文字、边框样式或图标表达。</span></div>
+            <div class="anatomy-row"><b>3</b><strong>图标按钮有名称</strong><span>所有仅图标操作必须提供 aria-label 与 Tooltip。</span></div>
+            <div class="anatomy-row"><b>4</b><strong>异步操作可恢复</strong><span>提交时禁用按钮并显示进度；失败时保留输入和重试入口。</span></div>
+          </div>
+        </aside>
+      </div>
+    </section>
+    <section class="section section-warm" id="cards" data-od-id="conversation-cards-section">
+      <div class="container">
+        <div class="section-head"><p class="eyebrow">03 · DOMAIN COMPONENT</p><h2 data-od-id="conversation-card-title">对话卡片是 Atlas 的视觉主语。</h2><p>卡片结构固定为状态栏、标题、摘要、证据元信息与操作区。拖动把手独立于打开详情操作，避免点击冲突。</p></div>
+        <div class="atlas-canvas" data-od-id="card-canvas-demo">
+          <div class="canvas-toolbar"><div class="canvas-title"><strong>passport-web</strong><span>3 张卡片 · 已自动保存布局</span></div><div class="segmented" role="group" aria-label="画布密度"><button aria-selected="true" data-density="comfortable">舒适</button><button aria-selected="false" data-density="compact">紧凑</button></div></div>
+          <span class="connector connector-main" aria-hidden="true"></span><span class="connector connector-branch" aria-hidden="true"></span>
+          <article class="conversation-card card-one" tabindex="0" data-od-id="conversation-card-origin">
+            <header><span class="pill">对话</span><span class="meta">10:24</span></header><h3>梳理登录回调异常</h3><p>生产环境登录后反复回到登录页，需要定位回调链路与环境配置差异。</p>
+            <footer><span>2 次工具 · 待办 1</span><div class="icon-actions"><button aria-label="从此创建分支" title="从此创建分支"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M6 3v12a4 4 0 0 0 4 4h8"/><path d="m14 15 4 4-4 4"/><path d="M6 7h8a4 4 0 0 0 4-4"/></svg></button><button aria-label="打开详情" title="打开详情"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="m9 18 6-6-6-6"/></svg></button></div></footer>
+          </article>
+          <article class="conversation-card is-current is-streaming card-two" tabindex="0" data-od-id="conversation-card-current">
+            <header><span class="pill pill-blue">当前 · 生成中</span><span class="meta">10:31</span></header><h3>检查中间件与回调地址</h3><p>正在核对生产环境的协议头与回调 URL 比较逻辑，工具过程保持折叠。</p>
+            <footer><span>3 次工具 · 流式回复</span><div class="icon-actions"><button aria-label="停止生成" title="停止生成"><svg viewBox="0 0 24 24" fill="currentColor"><rect x="7" y="7" width="10" height="10" rx="1"/></svg></button><button aria-label="打开详情" title="打开详情"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="m9 18 6-6-6-6"/></svg></button></div></footer>
+          </article>
+          <article class="conversation-card is-branch card-three" tabindex="0" data-od-id="conversation-card-branch">
+            <header><span class="pill pill-warn">另一种思路</span><span class="meta">10:36</span></header><h3>关闭 URL 校验</h3><p>此方案会削弱生产环境安全边界，保留为待验证分支，不推荐直接采纳。</p>
+            <footer><span>来源：检查中间件</span><div class="icon-actions"><button aria-label="比较分支" title="比较分支"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M8 3v14M16 7v14M5 14l3 3 3-3M13 10l3-3 3 3"/></svg></button><button aria-label="打开详情" title="打开详情"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="m9 18 6-6-6-6"/></svg></button></div></footer>
+          </article>
+        </div>
+      </div>
+    </section>
+    <section class="section" id="patterns" data-od-id="interaction-patterns-section">
+      <div class="container">
+        <div class="section-head"><p class="eyebrow">04 · INTERACTION PATTERNS</p><h2 data-od-id="interaction-patterns-title">复杂信息按层展开，不在卡片里堆满。</h2><p>卡片只承担识别与定位；详情、工具输出和危险操作分别交给 Dialog、折叠面板与 AlertDialog。</p></div>
+        <div class="grid-2">
+          <div class="stack">
+            <article class="card" data-od-id="detail-dialog-pattern"><span class="pill">Dialog</span><h3 style="margin-top:var(--space-4)">完整对话详情</h3><p style="color:var(--muted)">保持上下文、消息角色、工具过程与继续输入在同一条阅读轴上。桌面居中，窄屏改为底部 Sheet。</p></article>
+            <details class="card tool-run" open data-od-id="tool-run-pattern"><summary><span>read_file · 已完成</span><span class="pill pill-success">428 毫秒</span></summary><pre>src/auth/middleware.ts
+读取 126 行 · 未发现敏感输出</pre></details>
+          </div>
+          <div class="anatomy-list card" data-od-id="card-anatomy-panel">
+            <div class="anatomy-row"><b>A</b><strong>状态与类型</strong><span>“当前”“分支”“生成中”置于左上，时间置于右上。</span></div>
+            <div class="anatomy-row"><b>B</b><strong>标题与摘要</strong><span>标题最多两行；摘要最多三行，完整内容进入详情。</span></div>
+            <div class="anatomy-row"><b>C</b><strong>证据元信息</strong><span>工具、待办、文件与来源数量只展示已存在的数据。</span></div>
+            <div class="anatomy-row"><b>D</b><strong>快捷操作</strong><span>默认最多三个：分支、归档、打开；危险操作需要确认。</span></div>
+          </div>
+        </div>
+      </div>
+    </section>
+    <section class="section section-warm" id="mapping" data-od-id="component-mapping-section">
+      <div class="container">
+        <div class="section-head"><p class="eyebrow">05 · IMPLEMENTATION MAP</p><h2 data-od-id="component-mapping-title">shadcn 是基础，Atlas 组件表达产品语义。</h2><p>先统一现有 Button、Badge、Dialog，再按真实功能引入其余组件；不一次性复制整套组件库。</p></div>
+        <div class="ds-table-wrap"><table class="ds-table" data-od-id="component-mapping-table">
+          <thead><tr><th>Atlas 组件</th><th>shadcn / 基础能力</th><th>用途</th><th>必备状态</th></tr></thead>
+          <tbody>
+            <tr><td><code>ConversationCard</code></td><td>自定义 DOM + Button + Badge</td><td>会话识别、拖动与快捷操作</td><td>默认 / 当前 / 分支 / 流式 / 错误</td></tr>
+            <tr><td><code>ConversationDetail</code></td><td>Dialog · 移动端 Sheet</td><td>完整消息、工具过程、继续对话</td><td>加载 / 空内容 / 可发送 / 发送中</td></tr>
+            <tr><td><code>ToolRun</code></td><td>Collapsible + ScrollArea</td><td>配对展示工具调用与结果</td><td>进行中 / 成功 / 失败 / 已脱敏</td></tr>
+            <tr><td><code>AtlasSearch</code></td><td>Command + Input + Popover</td><td>全文检索、筛选与快捷跳转</td><td>输入 / 有结果 / 无结果 / 错误</td></tr>
+            <tr><td><code>BranchActions</code></td><td>DropdownMenu + AlertDialog</td><td>新建、比较、激活与归档分支</td><td>可用 / 不可用 / 确认 / 完成</td></tr>
+            <tr><td><code>TodoSource</code></td><td>Checkbox + Badge + Tooltip</td><td>待办状态与来源回跳</td><td>建议 / 已确认 / 阻塞 / 完成</td></tr>
+            <tr><td><code>CanvasToolbar</code></td><td>Button + Tooltip + Select</td><td>缩放、居中、布局与视图密度</td><td>默认 / 操作中 / 已保存</td></tr>
+          </tbody>
+        </table></div>
+      </div>
+    </section>
+    <section class="section" data-od-id="delivery-checklist-section" style="text-align:center">
+      <div class="container" style="max-width:700px"><h2 data-od-id="delivery-checklist-title">实施顺序已经明确。</h2><p class="lead">先迁移主题变量与三项现有组件，再实现 ConversationCard、ToolRun 和键盘可达的画布操作，最后补齐搜索与分支比较。</p><div class="hero-cta"><button class="btn btn-primary" id="showChecklist" data-od-id="show-checklist-button">查看交付检查清单</button></div></div>
+    </section>
+  </main>
+  <footer class="pagefoot" data-od-id="footer"><div class="container row-between"><span>DSH Atlas · UI 组件规范 1.0</span><span class="meta">React + TypeScript + Vite + shadcn/ui</span></div></footer>
+  <dialog class="dialog" id="cardDialog" aria-labelledby="dialogTitle" data-od-id="card-detail-dialog">
+    <div class="dialog-head"><div><span class="pill pill-blue">当前会话</span><h3 id="dialogTitle" style="margin-top:var(--space-3)">检查中间件与回调地址</h3><p>Dialog 用于完整阅读与继续工作，不承担画布布局操作。</p></div><button class="btn btn-icon btn-ghost" data-close aria-label="关闭详情"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
+    <div class="dialog-body">
+      <div class="message-block"><strong>你的消息</strong><p>检查生产环境的登录回调配置，确认为什么会重复跳转。</p></div>
+      <div class="message-block"><strong>DSH</strong><p>发现生产环境缺少协议前缀，导致中间件在比较回调地址时始终失败。</p></div>
+      <details class="card tool-run"><summary><span>read_file · 已完成</span><span class="meta">428 毫秒</span></summary><pre>src/auth/middleware.ts
+已定位 URL 比较逻辑</pre></details>
+      <div class="field" style="width:100%"><label for="continueConversation">继续当前会话</label><textarea class="input" id="continueConversation" rows="3" placeholder="输入下一步要求"></textarea></div>
+    </div>
+    <div class="dialog-foot"><button class="btn btn-outline" data-close>取消</button><button class="btn btn-primary" id="sendExample">发送到 DSH</button></div>
+  </dialog>
+  <div class="toast" id="toast" role="status" aria-live="polite"><span>规范摘要已复制，可直接用于组件迁移任务。</span></div>
+  <script>
+    const cardDialog=document.querySelector('#cardDialog'),toast=document.querySelector('#toast');
+    const showDialog=()=>cardDialog.showModal();
+    document.querySelector('#openDemo').addEventListener('click',showDialog);
+    document.querySelector('#showChecklist').addEventListener('click',showDialog);
+    document.querySelectorAll('[data-close]').forEach(button=>button.addEventListener('click',()=>cardDialog.close()));
+    cardDialog.addEventListener('click',event=>{if(event.target===cardDialog)cardDialog.close()});
+    document.querySelector('#sendExample').addEventListener('click',()=>{cardDialog.close();toast.querySelector('span').textContent='示例已提交：发送按钮进入禁用与进度状态。';toast.classList.add('is-visible');window.setTimeout(()=>toast.classList.remove('is-visible'),2600)});
+    document.querySelector('#copyGuideline').addEventListener('click',async()=>{
+      const summary='DSH Atlas UI：统一 Notion 暖中性色与 44px 控件；shadcn/ui 负责通用交互；ConversationCard、ToolRun、BranchActions 表达领域语义；每个状态必须具备文字或结构提示、键盘焦点与异步反馈。';
+      try{await navigator.clipboard.writeText(summary);toast.querySelector('span').textContent='规范摘要已复制，可直接用于组件迁移任务。'}catch{toast.querySelector('span').textContent=summary}
+      toast.classList.add('is-visible');window.setTimeout(()=>toast.classList.remove('is-visible'),3200);
+    });
+    document.querySelectorAll('.segmented').forEach(group=>group.addEventListener('click',event=>{const button=event.target.closest('button');if(!button)return;group.querySelectorAll('button').forEach(item=>item.setAttribute('aria-selected',String(item===button)))}));
+  </script>
+</body>
+</html>
+

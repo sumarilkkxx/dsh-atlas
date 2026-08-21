@@ -1,0 +1,39 @@
+# Dependencies and package-manager caches
+node_modules/
+.pnpm-store/
+
+# Local planning and design-review material
+项目规划.md
+
+# Tests and generated test output
+test/
+tests/
+*.test.*
+*.spec.*
+coverage/
+playwright-report/
+test-results/
+
+# Local DSH / Atlas state
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+.dsh/
+.atlas/
+
+# Environment, logs, and machine-local files
+.env
+.env.*
+!.env.example
+*.local
+*.log
+npm-debug.log*
+pnpm-debug.log*
+.DS_Store
+Thumbs.db
+
+# Editor metadata
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,8 @@
+# DSH Atlas only extends the Web profile and reuses DSH's existing Web Server.
+- insert:
+    - id: atlas
+      name: dsh-atlas
+      config:
+        dataFile: !!js dshHomePath('atlas/atlas.db')
+        autoProjection: true
+        trustedHosts: []
