@@ -22,7 +22,7 @@ window.__ModuleLoader__.load({
       const accounted = new Set(snapshot.items.flatMap(workspace => workspace.sessionIds))
       return [...snapshot.items.map(workspace => ({ id: workspace.workspaceId, title: workspace.title, path: workspace.path, sessionIds: workspace.sessionIds })), { id: 'dsh-ungrouped', title: '未分组', path: null, sessionIds: sessions.ids.filter(id => !accounted.has(id)) }]
     }
-    module.exports.inject = ['sessions', 'workspaces', 'modelDirectories']
+    module.exports.inject = ['sessions', 'workspaces', 'modelDirectories', 'remote', 'remote.commands', 'connection', 'llm']
     module.exports.apply = ctx => {
       const prompt = async (sessionId, text) => {
         const scope = ctx.sessions.scope(sessionId)
@@ -41,6 +41,25 @@ window.__ModuleLoader__.load({
         const directory = ctx.modelDirectories.directoryFor(sessionId)
         await directory.load()
         return { directory, snapshot: directory.store.getSnapshot() }
+      }
+      const summarize = async (sessionId, transcript) => {
+        if (typeof ctx.llm?.stream !== 'function') throw new Error('当前 DSH 环境不支持生成会话摘要')
+        const { snapshot } = await modelDirectory(sessionId)
+        const current = snapshot.current
+        if (!current?.provider || !current?.model) throw new Error('请先为该对话选择可用模型')
+        const prompt = `你是 DSH Atlas 的会话摘要器。只根据下面的对话投影，输出一条不超过 90 个汉字的中文摘要，交代目标、最新有效进展和未完成的下一步（若有）。不要使用 Markdown、标题、引号或“摘要：”前缀。\n\n对话投影：\n${transcript}`
+        const chunks = new Map()
+        const finished = new Map()
+        const stream = ctx.llm.stream({ provider: current.provider, model: current.model, ...(current.reasoningEffort ? { reasoningEffort: current.reasoningEffort } : {}), messages: [{ id: `atlas-summary-${Date.now()}`, role: 'user', content: [{ type: 'text', text: prompt }], source: { kind: 'plugin', plugin: 'dsh-atlas' } }], maxTokens: 180 })
+        for await (const chunk of stream) {
+          const index = Number.isInteger(chunk?.index) ? chunk.index : 0
+          if (chunk?.type === 'text-delta') chunks.set(index, `${chunks.get(index) ?? ''}${String(chunk.text ?? chunk.delta ?? '')}`)
+          if (chunk?.type === 'block-end' && chunk.block?.type === 'text' && typeof chunk.block.text === 'string') finished.set(index, chunk.block.text)
+          if (chunk?.type === 'error') throw new Error(chunk.error?.message ?? '摘要生成失败')
+        }
+        const text = [...(finished.size > 0 ? finished : chunks).entries()].sort(([a], [b]) => a - b).map(([, value]) => value).join('').replace(/\s+/g, ' ').trim().slice(0, 360)
+        if (text === '') throw new Error('模型没有返回可用摘要')
+        return { text, provider: current.provider, model: current.model }
       }
       const style = document.createElement('style')
       style.textContent = '.dsh-atlas-switch{position:fixed;z-index:120;top:12px;left:50%;display:flex;gap:2px;transform:translateX(-50%);border:1px solid #d9e0e4;border-radius:999px;background:rgba(255,255,255,.96);padding:3px;backdrop-filter:blur(10px)}.dsh-atlas-switch button{height:28px;border:0;border-radius:999px;background:transparent;padding:0 11px;color:#5b6876;font:600 12px "Microsoft YaHei UI","PingFang SC","Segoe UI",sans-serif;cursor:pointer}.dsh-atlas-switch button.active{background:#172033;color:#fff}.dsh-atlas-switch button:focus-visible{outline:2px solid #0b9b83;outline-offset:2px}.dsh-atlas-overlay{position:fixed;z-index:100;inset:0;background:#f7f8fa}.dsh-atlas-overlay[hidden]{display:none}.dsh-atlas-overlay iframe{display:block;width:100%;height:100%;border:0}'
@@ -163,8 +182,30 @@ window.__ModuleLoader__.load({
         if (event.data.type === 'atlas:open-native-models') { nativeComposer(event.data.sessionId, '', 'model'); return }
         if (event.data.type === 'atlas:open-native-command') { nativeComposer(event.data.sessionId, '', 'command'); return }
         if (event.data.type === 'atlas:open-native-files') { nativeComposer(event.data.sessionId, '@'); return }
+        if (event.data.type === 'atlas:generate-summary') {
+          const transcript = typeof event.data.transcript === 'string' ? event.data.transcript.trim().slice(0, 16_000) : ''
+          if (transcript === '') return send('atlas:error', { requestId: event.data.requestId, message: '没有可用于生成摘要的对话内容' })
+          summarize(event.data.sessionId, transcript).then(summary => send('atlas:conversation-summary', { requestId: event.data.requestId, summary })).catch(error => send('atlas:error', { requestId: event.data.requestId, message: error instanceof Error ? error.message : '会话摘要生成失败' }))
+          return
+        }
         if (event.data.type === 'atlas:get-models') {
           modelDirectory(event.data.sessionId).then(({ snapshot }) => send('atlas:model-directory', { requestId: event.data.requestId, directory: snapshot })).catch(error => send('atlas:error', { requestId: event.data.requestId, message: error instanceof Error ? error.message : '模型目录加载失败' }))
+          return
+        }
+        if (event.data.type === 'atlas:get-commands') {
+          Promise.resolve().then(async () => {
+            const result = await ctx.remote.commands.list(event.data.sessionId)
+            if (!result.ok) throw new Error(result.error?.message ?? '无法读取 DSH 命令目录')
+            send('atlas:command-directory', { requestId: event.data.requestId, commands: result.value ?? [] })
+          }).catch(error => send('atlas:error', { requestId: event.data.requestId, message: error instanceof Error ? error.message : '无法读取 DSH 命令目录' }))
+          return
+        }
+        if (event.data.type === 'atlas:get-skills') {
+          Promise.resolve().then(async () => {
+            const { result } = await ctx.connection.api.skills.list({ sessionId: event.data.sessionId }, new AbortController().signal)
+            if (!result.ok) throw new Error(result.error?.message ?? '无法读取 DSH 技能目录')
+            send('atlas:skill-directory', { requestId: event.data.requestId, skills: result.value?.skills ?? [] })
+          }).catch(error => send('atlas:error', { requestId: event.data.requestId, message: error instanceof Error ? error.message : '无法读取 DSH 技能目录' }))
           return
         }
         if (event.data.type === 'atlas:select-model') {

@@ -52,10 +52,17 @@ export function apply(ctx, config = {}) {
       if (path === '/atlas/api/conversations' && req.method === 'GET') return sendJson(res, 200, await store.conversationCards(new URL(req.url ?? '/', 'http://atlas.local').searchParams.get('cwd') ?? undefined))
       if (path === '/atlas/api/workspaces' && req.method === 'GET') return sendJson(res, 200, { workspaces: (await store.graph()).workspaces })
       if (path === '/atlas/api/sessions/sync' && req.method === 'POST') { const body = await readJson(req); return sendJson(res, 200, await store.syncSessions(body.sessions, body.removedSessionIds)) }
+      const summary = /^\/atlas\/api\/conversations\/([^/]+)\/summary$/.exec(path)
+      if (summary !== null && req.method === 'GET') return sendJson(res, 200, { summary: await store.conversationSummary(decodeURIComponent(summary[1])) })
+      if (summary !== null && req.method === 'PUT') return sendJson(res, 200, { summary: await store.saveConversationSummary(decodeURIComponent(summary[1]), await readJson(req)) })
       const detail = /^\/atlas\/api\/cards\/([^/]+)$/.exec(path)
       if (detail !== null && req.method === 'GET') return sendJson(res, 200, await store.cardDetail(decodeURIComponent(detail[1])))
       const position = /^\/atlas\/api\/cards\/([^/]+)\/position$/.exec(path)
       if (position !== null && req.method === 'PATCH') { const id = decodeURIComponent(position[1]); const body = await readJson(req); return sendJson(res, 200, { position: id.includes(':') ? await store.setCardPosition(id, body.position) : await store.setPosition(id, body.position) }) }
+      const size = /^\/atlas\/api\/cards\/([^/]+)\/size$/.exec(path)
+      if (size !== null && req.method === 'PATCH') { const body = await readJson(req); return sendJson(res, 200, { size: await store.setCardSize(decodeURIComponent(size[1]), body.size) }) }
+      const marker = /^\/atlas\/api\/cards\/([^/]+)\/marker$/.exec(path)
+      if (marker !== null && req.method === 'PATCH') return sendJson(res, 200, { marker: await store.setCardMarker(decodeURIComponent(marker[1]), await readJson(req)) })
       const hide = /^\/atlas\/api\/cards\/([^/]+)\/hide$/.exec(path)
       if (hide !== null && req.method === 'POST') { await store.hide(sessionIdForCard(decodeURIComponent(hide[1]))); return sendJson(res, 204) }
       const remove = /^\/atlas\/api\/cards\/([^/]+)\/delete$/.exec(path)

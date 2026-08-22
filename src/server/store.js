@@ -5,6 +5,8 @@ import { DatabaseSync } from 'node:sqlite'
 
 const MAX_TEXT_LENGTH = 8_000
 const MAX_TITLE_LENGTH = 160
+const MAX_SUMMARY_LENGTH = 360
+const MARKER_KINDS = new Set(['none', 'conclusion', 'verify', 'ruleout', 'decision', 'pivot', 'open'])
 
 export class AtlasStore {
   constructor(dataFile) {
@@ -58,6 +60,12 @@ export class AtlasStore {
         y INTEGER NOT NULL,
         updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS atlas_card_size (
+        card_id TEXT PRIMARY KEY,
+        width INTEGER NOT NULL,
+        height INTEGER NOT NULL,
+        updated_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS atlas_hidden_card (
         card_id TEXT PRIMARY KEY,
         hidden_at TEXT NOT NULL
@@ -65,6 +73,12 @@ export class AtlasStore {
       CREATE TABLE IF NOT EXISTS atlas_card_parent_override (
         card_id TEXT PRIMARY KEY,
         parent_card_id TEXT,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS atlas_card_marker (
+        card_id TEXT PRIMARY KEY,
+        important INTEGER NOT NULL DEFAULT 0 CHECK (important IN (0, 1)),
+        kind TEXT NOT NULL DEFAULT 'none' CHECK (kind IN ('none', 'conclusion', 'verify', 'ruleout', 'decision', 'pivot', 'open')),
         updated_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS atlas_pending_tool (
@@ -76,10 +90,18 @@ export class AtlasStore {
         updated_at TEXT NOT NULL,
         PRIMARY KEY (session_id, call_id)
       );
+      CREATE TABLE IF NOT EXISTS atlas_conversation_summary (
+        root_session_id TEXT PRIMARY KEY,
+        revision TEXT NOT NULL,
+        text TEXT NOT NULL,
+        provider TEXT,
+        model TEXT,
+        generated_at TEXT NOT NULL
+      );
       CREATE INDEX IF NOT EXISTS atlas_node_cwd_idx ON atlas_node(cwd, updated_at DESC);
       CREATE INDEX IF NOT EXISTS atlas_message_session_idx ON atlas_message(session_id, source_seq);
       INSERT OR IGNORE INTO atlas_meta(key, value) VALUES ('schema_version', '1');
-      UPDATE atlas_meta SET value = '3' WHERE key = 'schema_version';
+      UPDATE atlas_meta SET value = '6' WHERE key = 'schema_version';
     `)
   }
 
@@ -120,16 +142,23 @@ export class AtlasStore {
       WHERE n.hidden = 0 ${scoped ? 'AND n.cwd = ?' : ''} ORDER BY m.session_id, m.source_seq`).all(...parameters)
     const messagesBySession = new Map()
     for (const row of messageRows) messagesBySession.set(row.session_id, [...(messagesBySession.get(row.session_id) ?? []), toMessage(row)])
+    const taskRows = this.db.prepare(`SELECT t.id, t.session_id, t.source_seq, t.content, t.status, t.updated_at
+      FROM atlas_task t JOIN atlas_node n ON n.session_id = t.session_id
+      WHERE n.hidden = 0 ${scoped ? 'AND n.cwd = ?' : ''} ORDER BY t.session_id, t.source_seq, t.id`).all(...parameters)
+    const tasksBySession = new Map()
+    for (const row of taskRows) tasksBySession.set(row.session_id, [...(tasksBySession.get(row.session_id) ?? []), toTask(row)])
     const positions = new Map(this.db.prepare('SELECT card_id, x, y FROM atlas_card_position').all().map(row => [row.card_id, { x: row.x, y: row.y }]))
+    const sizes = new Map(this.db.prepare('SELECT card_id, width, height FROM atlas_card_size').all().map(row => [row.card_id, { width: row.width, height: row.height }]))
     const cards = []
     const cardsBySession = new Map()
     const lastCardBySession = new Map()
     for (const node of nodes) {
       const messages = messagesBySession.get(node.session_id) ?? []
+      const tasks = tasksBySession.get(node.session_id) ?? []
       const turns = messages.filter(message => message.kind === 'user')
       const sessionCards = []
       if (turns.length === 0) {
-        sessionCards.push(this.sessionCard(node, messages, null, undefined, positions))
+        sessionCards.push(this.sessionCard(node, messages, tasks, null, undefined, positions, sizes))
         cards.push(...sessionCards)
         cardsBySession.set(node.session_id, sessionCards)
         lastCardBySession.set(node.session_id, `${node.session_id}:session`)
@@ -138,8 +167,9 @@ export class AtlasStore {
       for (const [index, turn] of turns.entries()) {
         const next = turns[index + 1]
         const range = messages.filter(message => message.sourceSeq >= turn.sourceSeq && (next === undefined || message.sourceSeq < next.sourceSeq))
+        const taskRange = tasks.filter(task => task.sourceSeq >= turn.sourceSeq && (next === undefined || task.sourceSeq < next.sourceSeq))
         const previous = index === 0 ? undefined : sessionCards.at(-1)?.id
-        sessionCards.push(this.sessionCard(node, range, turn, previous, positions))
+        sessionCards.push(this.sessionCard(node, range, taskRange, turn, previous, positions, sizes))
       }
       cards.push(...sessionCards)
       cardsBySession.set(node.session_id, sessionCards)
@@ -154,24 +184,67 @@ export class AtlasStore {
     const hiddenCards = new Set(this.db.prepare('SELECT card_id FROM atlas_hidden_card').all().map(row => row.card_id))
     const parentOverrides = new Map(this.db.prepare('SELECT card_id, parent_card_id FROM atlas_card_parent_override').all().map(row => [row.card_id, row.parent_card_id]))
     for (const card of cards) if (parentOverrides.has(card.id)) card.parentCardId = parentOverrides.get(card.id) ?? undefined
+    const markers = new Map(this.db.prepare('SELECT card_id, important, kind, updated_at FROM atlas_card_marker').all().map(row => [row.card_id, toMarker(row)]))
+    for (const card of cards) card.marker = markers.get(card.id) ?? emptyMarker()
     return { cards: cards.filter(card => !hiddenCards.has(card.id)), workspaces: this.workspaceSummaries(nodes.map(toNode)) }
   }
 
-  sessionCard(node, messages, turn, parentCardId, positions) {
+  sessionCard(node, messages, tasks, turn, parentCardId, positions, sizes) {
     const sourceSeq = turn?.sourceSeq ?? null
     const id = sourceSeq === null ? `${node.session_id}:session` : `${node.session_id}:turn:${sourceSeq}`
     const answer = [...messages].reverse().find(message => message.kind === 'assistant')
     const process = messages.flatMap(message => message.process ?? [])
-    const todos = messages.filter(message => message.kind === 'todo').flatMap(message => message.text.split('\n')).filter(Boolean)
     const saved = positions.get(id)
+    const savedSize = sizes.get(id)
     return {
       id, sessionId: node.session_id, cwd: node.cwd, title: turn?.text ?? node.title,
       summary: answer?.text ?? (turn === undefined ? '等待这条会话的第一条消息。' : '等待回复…'),
       sourceSeq, branchSeq: answer?.sourceSeq ?? sourceSeq, parentSessionId: node.parent_session_id, seedLength: node.seed_length,
-      parentCardId, position: saved === undefined ? null : { x: saved.x, y: saved.y },
-      tools: process.length, todos: todos.length, updatedAt: node.updated_at,
-      messages, process,
+      parentCardId, position: saved === undefined ? null : { x: saved.x, y: saved.y }, size: savedSize === undefined ? null : { width: savedSize.width, height: savedSize.height },
+      tools: process.length, todos: tasks.length, updatedAt: node.updated_at,
+      messages, process, tasks,
     }
+  }
+
+  async setCardMarker(cardId, marker) {
+    await this.ready
+    const normalized = normalizeMarker(marker)
+    const { cards } = await this.conversationCards()
+    if (!cards.some(card => card.id === cardId)) throw new AtlasNotFoundError('对话卡片不存在')
+    if (!normalized.important && normalized.kind === 'none') {
+      this.db.prepare('DELETE FROM atlas_card_marker WHERE card_id = ?').run(cardId)
+      return emptyMarker()
+    }
+    const updatedAt = now()
+    this.db.prepare(`INSERT INTO atlas_card_marker(card_id, important, kind, updated_at) VALUES (?, ?, ?, ?)
+      ON CONFLICT(card_id) DO UPDATE SET important = excluded.important, kind = excluded.kind, updated_at = excluded.updated_at`)
+      .run(cardId, normalized.important ? 1 : 0, normalized.kind, updatedAt)
+    return { ...normalized, updatedAt }
+  }
+
+  async conversationSummary(rootSessionId) {
+    await this.ready
+    if (typeof rootSessionId !== 'string' || rootSessionId.trim() === '') throw new AtlasInputError('会话标识无效')
+    const row = this.db.prepare('SELECT root_session_id, revision, text, provider, model, generated_at FROM atlas_conversation_summary WHERE root_session_id = ?').get(rootSessionId)
+    return row === undefined ? null : toConversationSummary(row)
+  }
+
+  async saveConversationSummary(rootSessionId, summary) {
+    await this.ready
+    if (typeof rootSessionId !== 'string' || rootSessionId.trim() === '') throw new AtlasInputError('会话标识无效')
+    const revision = typeof summary?.revision === 'string' ? summary.revision.trim() : ''
+    const text = typeof summary?.text === 'string' ? summary.text.replace(/\s+/g, ' ').trim() : ''
+    if (revision === '' || revision.length > 160) throw new AtlasInputError('摘要版本无效')
+    if (text === '') throw new AtlasInputError('摘要不能为空')
+    if (text.length > MAX_SUMMARY_LENGTH) throw new AtlasInputError(`摘要不能超过 ${MAX_SUMMARY_LENGTH} 个字符`)
+    const provider = typeof summary?.provider === 'string' ? summary.provider.slice(0, 120) : null
+    const model = typeof summary?.model === 'string' ? summary.model.slice(0, 160) : null
+    const generatedAt = now()
+    this.db.prepare(`INSERT INTO atlas_conversation_summary(root_session_id, revision, text, provider, model, generated_at)
+      VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(root_session_id) DO UPDATE SET
+      revision = excluded.revision, text = excluded.text, provider = excluded.provider, model = excluded.model, generated_at = excluded.generated_at`)
+      .run(rootSessionId, revision, text, provider, model, generatedAt)
+    return { rootSessionId, revision, text, provider, model, generatedAt }
   }
 
   workspaceSummaries(nodes) {
@@ -219,6 +292,16 @@ export class AtlasStore {
     const y = boundedCoordinate(position?.y)
     this.db.prepare('INSERT INTO atlas_card_position(card_id, x, y, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(card_id) DO UPDATE SET x = excluded.x, y = excluded.y, updated_at = excluded.updated_at').run(cardId, x, y, now())
     return { x, y }
+  }
+
+  async setCardSize(cardId, size) {
+    await this.ready
+    const { cards } = await this.conversationCards()
+    if (!cards.some(card => card.id === cardId)) throw new AtlasNotFoundError('对话卡片不存在')
+    const width = boundedCardDimension(size?.width, 360, 820, 'width')
+    const height = boundedCardDimension(size?.height, 250, 720, 'height')
+    this.db.prepare('INSERT INTO atlas_card_size(card_id, width, height, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(card_id) DO UPDATE SET width = excluded.width, height = excluded.height, updated_at = excluded.updated_at').run(cardId, width, height, now())
+    return { width, height }
   }
 
   async rename(sessionId, title) {
@@ -533,8 +616,19 @@ function sessionCwd(session) { const cwd = session?.header?.meta?.cwd ?? session
 function titleOf(value, fallback) { return typeof value === 'string' && value.trim() !== '' ? value.trim().slice(0, MAX_TITLE_LENGTH) : fallback }
 function titleFromText(text) { const compact = text.replaceAll(/\s+/g, ' ').trim(); return (compact.length > 54 ? `${compact.slice(0, 54)}…` : compact) || 'DSH 对话' }
 function boundedCoordinate(value) { const number = Number(value); if (!Number.isFinite(number)) throw new AtlasInputError('position must be finite'); return Math.round(Math.max(-4000, Math.min(8000, number))) }
+function boundedCardDimension(value, minimum, maximum, name) { const number = Number(value); if (!Number.isFinite(number)) throw new AtlasInputError(`${name} must be finite`); return Math.round(Math.max(minimum, Math.min(maximum, number))) }
 function eventTime(event) { return typeof event?.time === 'string' ? event.time : Number.isFinite(event?.time) ? new Date(event.time).toISOString() : now() }
 function now() { return new Date().toISOString() }
 function toNode(row) { return { id: row.session_id, cwd: row.cwd, title: row.title, parentSessionId: row.parent_session_id, seedLength: row.seed_length, position: { x: row.x, y: row.y }, hidden: row.hidden === 1, updatedAt: row.updated_at } }
 function toMessage(row) { return { sourceSeq: row.source_seq, kind: row.kind, text: row.text, turn: row.turn_number, step: row.step_number, process: row.process_json === null ? [] : JSON.parse(row.process_json), at: row.at } }
+function toTask(row) { return { id: row.id, sessionId: row.session_id, sourceSeq: row.source_seq, content: row.content, status: row.status, updatedAt: row.updated_at } }
+function toConversationSummary(row) { return { rootSessionId: row.root_session_id, revision: row.revision, text: row.text, provider: row.provider, model: row.model, generatedAt: row.generated_at } }
+function emptyMarker() { return { important: false, kind: 'none', updatedAt: null } }
+function toMarker(row) { return { important: row.important === 1, kind: MARKER_KINDS.has(row.kind) ? row.kind : 'none', updatedAt: row.updated_at } }
+function normalizeMarker(marker) {
+  const important = marker?.important === true
+  const kind = typeof marker?.kind === 'string' && MARKER_KINDS.has(marker.kind) ? marker.kind : undefined
+  if (kind === undefined) throw new AtlasInputError('标记类型无效')
+  return { important, kind }
+}
 function workspaceTitle(cwd) { const segment = String(cwd).replace(/[\\/]+$/, '').split(/[\\/]/).at(-1); return segment?.trim() || '未指定工作目录' }

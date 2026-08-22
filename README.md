@@ -22,6 +22,7 @@ DSH Atlas 是面向 DeepSeek Harness Web 的对话管理插件。它以 DSH 原�
 - 支持整卡拖拽、画布平移、50%–400% 缩放、自动整理和当前节点定位。
 - 使用平滑曲线连接上下文节点，并通过二级菜单快速定位真实会话分支。
 - 卡片位置持久化到本地 Atlas 数据库；缩放、视口和折叠状态保存在浏览器本地。
+- 每次打开或切换画布时，Atlas 会先展示已有摘要；当会话投影版本发生变化时，再用当前 DSH 模型异步生成并缓存一条最新摘要，不会向原对话写入“总结”消息。
 
 ### 卡片与详情
 
@@ -64,6 +65,8 @@ flowchart LR
     Store --> UI[React 卡片画布]
     UI --> Bridge
     Bridge --> Native[DSH Session API<br/>模型 / 命令 / Prompt / Fork]
+    Bridge --> LLM[当前 DSH 模型<br/>会话摘要]
+    UI --> Store
 ```
 
 项目由四个主要部分组成：
@@ -75,7 +78,7 @@ flowchart LR
    `index.js` 挂载 Atlas 前端资源和本地 API；`src/server/store.js` 将 DSH 持久事件幂等投影到 SQLite。冷启动重放不会重复生成卡片，分支关系、工具过程和卡片位置均使用稳定 Session/Event 标识。
 
 3. **浏览器桥接**
-   `client.js` 在 DSH 页面注册“对话 / 卡片视图”切换，并连接 `ctx.sessions`、`ctx.workspaces` 和会话级模型目录。模型选择、命令、Prompt、创建会话与 Fork 都调用 DSH 原生接口，不修改模型请求链路。
+   `client.js` 在 DSH 页面注册“对话 / 卡片视图”切换，并连接 `ctx.sessions`、`ctx.workspaces`、会话级模型目录与 `ctx.llm`。模型选择、命令、Prompt、创建会话与 Fork 都调用 DSH 原生接口；摘要请求使用当前会话选择的模型，但不写入原会话。
 
 4. **React 画布**
    `src/app.tsx` 负责会话树、卡片布局、曲线连接、拖拽、详情、Markdown、Artifact 和内嵌输入框；生产构建输出到 `dist/`，由 Host 插件同源加载。
@@ -162,9 +165,10 @@ dsh-atlas/
 ## 数据与安全边界
 
 - DSH Session Log 始终是会话历史的唯一事实来源。
-- Atlas 数据库默认位于 `$DSH_HOME/atlas/atlas.db`，保存展示投影、分支关系和卡片位置。
+- Atlas 数据库默认位于 `$DSH_HOME/atlas/atlas.db`，保存展示投影、分支关系、卡片位置和版本化会话摘要。
 - Atlas 不覆写或删除 DSH 原始历史；“删除卡片”只隐藏 Atlas 投影。
 - 模型选择、推理等级、命令、Prompt 和 Fork 均通过 DSH 当前会话接口执行。
+- 仅在打开或切换画布且摘要缓存已过期时，Atlas 会将压缩后的可见会话投影发送给当前选定模型生成摘要；摘要不会作为消息写回 DSH Session Log。
 - `render_html` 使用受限 iframe 和 Content Security Policy，禁止外部网络、表单、对象和顶层导航。
 - 默认仅允许同源/受信 Host 访问 Atlas API；额外 Host 可通过插件配置显式添加。
 
