@@ -117,7 +117,7 @@ export class AtlasStore {
              COUNT(m.source_seq) AS message_count,
              SUM(CASE WHEN m.kind = 'assistant' THEN 1 ELSE 0 END) AS reply_count
       FROM atlas_node n LEFT JOIN atlas_message m ON m.session_id = n.session_id
-      WHERE n.hidden = 0 GROUP BY n.session_id ORDER BY n.updated_at ASC
+      WHERE n.hidden = 0 GROUP BY n.session_id ORDER BY n.created_at ASC, n.session_id ASC
     `).all().map(row => ({
       id: row.session_id,
       cwd: row.cwd,
@@ -136,7 +136,11 @@ export class AtlasStore {
     await this.ready
     const scoped = typeof cwd === 'string'
     const parameters = scoped ? [cwd] : []
-    const nodes = this.db.prepare(`SELECT session_id, cwd, title, parent_session_id, seed_length, x, y, updated_at FROM atlas_node WHERE hidden = 0 ${scoped ? 'AND cwd = ?' : ''} ORDER BY updated_at ASC`).all(...parameters)
+    // The sidebar is a conversation timeline, not a "recently touched" list.  A
+    // projection refresh updates `updated_at`, so ordering by it made a selected
+    // conversation jump to a different position after every click.  Keep the
+    // insertion order stable and only use updates to refresh the card contents.
+    const nodes = this.db.prepare(`SELECT session_id, cwd, title, parent_session_id, seed_length, x, y, created_at, updated_at FROM atlas_node WHERE hidden = 0 ${scoped ? 'AND cwd = ?' : ''} ORDER BY created_at ASC, session_id ASC`).all(...parameters)
     const messageRows = this.db.prepare(`SELECT m.session_id, m.source_seq, m.kind, m.text, m.turn_number, m.step_number, m.process_json, m.at
       FROM atlas_message m JOIN atlas_node n ON n.session_id = m.session_id
       WHERE n.hidden = 0 ${scoped ? 'AND n.cwd = ?' : ''} ORDER BY m.session_id, m.source_seq`).all(...parameters)
@@ -197,8 +201,8 @@ export class AtlasStore {
     const saved = positions.get(id)
     const savedSize = sizes.get(id)
     return {
-      id, sessionId: node.session_id, cwd: node.cwd, title: turn?.text ?? node.title,
-      summary: answer?.text ?? (turn === undefined ? '等待这条会话的第一条消息。' : '等待回复…'),
+      id, sessionId: node.session_id, cwd: node.cwd, title: displayMessageText(turn?.text ?? node.title),
+      summary: displayMessageText(answer?.text ?? (turn === undefined ? '等待这条会话的第一条消息。' : '等待回复…')),
       sourceSeq, branchSeq: answer?.sourceSeq ?? sourceSeq, parentSessionId: node.parent_session_id, seedLength: node.seed_length,
       parentCardId, position: saved === undefined ? null : { x: saved.x, y: saved.y }, size: savedSize === undefined ? null : { width: savedSize.width, height: savedSize.height },
       tools: process.length, todos: tasks.length, updatedAt: node.updated_at,
@@ -402,7 +406,12 @@ export class AtlasStore {
       if (typeof item?.id !== 'string' || item.id === '' || item.blank === true || typeof item.cwd !== 'string' || item.cwd === '') continue
       const existing = this.db.prepare('SELECT hidden FROM atlas_node WHERE session_id = ?').get(item.id)
       if (existing?.hidden === 1) continue
-      this.ensureNode({ id: item.id, title: item.title, header: { meta: { cwd: item.cwd }, parentSession: item.parentId ?? undefined } })
+      // `sessions.list` does not consistently expose a parent for an existing
+      // fork.  Treat an absent parent as unknown here; otherwise selecting a
+      // branch rewrites its durable relationship to a root session.
+      const header = { meta: { cwd: item.cwd } }
+      if (typeof item.parentId === 'string' && item.parentId !== '') header.parentSession = item.parentId
+      this.ensureNode({ id: item.id, title: item.title, header })
     }
     return this.graph()
   }
@@ -451,10 +460,12 @@ export class AtlasStore {
   ensureNode(session) {
     const id = session?.id
     if (typeof id !== 'string' || id === '') return
-    const existing = this.db.prepare('SELECT session_id FROM atlas_node WHERE session_id = ?').get(id)
+    const existing = this.db.prepare('SELECT session_id, parent_session_id FROM atlas_node WHERE session_id = ?').get(id)
     const header = session.header ?? {}
     const cwd = sessionCwd(session)
-    const parentSessionId = typeof header.parentSession === 'string' ? header.parentSession : null
+    const hasParentSession = Object.prototype.hasOwnProperty.call(header, 'parentSession')
+    const requestedParentSessionId = typeof header.parentSession === 'string' ? header.parentSession : hasParentSession ? null : undefined
+    const parentSessionId = requestedParentSessionId === undefined ? existing?.parent_session_id ?? null : requestedParentSessionId
     const seedLength = Number.isSafeInteger(header.seedLength) ? header.seedLength : null
     const title = titleOf(session.title, parentSessionId === null ? 'DSH 对话' : '另一种思路')
     if (existing !== undefined) {
@@ -480,7 +491,7 @@ export class AtlasStore {
     if (projection === null) return
     const insert = this.db.prepare('INSERT OR IGNORE INTO atlas_message(session_id, source_seq, kind, text, turn_number, step_number, process_json, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(sessionId, event.seq, projection.kind, projection.text, projection.turn, projection.step, projection.kind === 'assistant' ? '[]' : null, eventTime(event))
     if (projection.kind === 'assistant') this.attachPendingTools(sessionId, projection.turn, projection.step, event.seq)
-    if (insert.changes > 0) this.db.prepare('UPDATE atlas_node SET updated_at = ?, title = CASE WHEN title = ? AND ? = ? THEN ? ELSE title END WHERE session_id = ?').run(eventTime(event), 'DSH 对话', projection.kind, 'user', titleFromText(projection.text), sessionId)
+    if (insert.changes > 0) this.db.prepare('UPDATE atlas_node SET updated_at = ?, title = CASE WHEN title = ? AND ? = ? THEN ? ELSE title END WHERE session_id = ?').run(eventTime(event), 'DSH 对话', projection.kind, 'user', titleFromText(displayMessageText(projection.text)), sessionId)
     if (event.type === 'todo/write') this.replaceTasks(sessionId, event)
   }
 
@@ -615,6 +626,12 @@ function runtimeContext(text) { return text.trimStart().startsWith('Current runt
 function sessionCwd(session) { const cwd = session?.header?.meta?.cwd ?? session?.header?.cwd; return typeof cwd === 'string' && cwd.trim() !== '' ? cwd : '未指定工作目录' }
 function titleOf(value, fallback) { return typeof value === 'string' && value.trim() !== '' ? value.trim().slice(0, MAX_TITLE_LENGTH) : fallback }
 function titleFromText(text) { const compact = text.replaceAll(/\s+/g, ' ').trim(); return (compact.length > 54 ? `${compact.slice(0, 54)}…` : compact) || 'DSH 对话' }
+function displayMessageText(text) {
+  return String(text ?? '').replace(/<atlas_attachment\s+([^>]*)>[\s\S]*?<\/atlas_attachment>/gi, (_all, attributes) => {
+    const name = /name="([^"]*)"/i.exec(String(attributes))?.[1]?.replaceAll('&quot;', '"').replaceAll('&lt;', '<').replaceAll('&gt;', '>').replaceAll('&amp;', '&') ?? '文件'
+    return `\n[附件：${name}]\n`
+  }).trim()
+}
 function boundedCoordinate(value) { const number = Number(value); if (!Number.isFinite(number)) throw new AtlasInputError('position must be finite'); return Math.round(Math.max(-4000, Math.min(8000, number))) }
 function boundedCardDimension(value, minimum, maximum, name) { const number = Number(value); if (!Number.isFinite(number)) throw new AtlasInputError(`${name} must be finite`); return Math.round(Math.max(minimum, Math.min(maximum, number))) }
 function eventTime(event) { return typeof event?.time === 'string' ? event.time : Number.isFinite(event?.time) ? new Date(event.time).toISOString() : now() }

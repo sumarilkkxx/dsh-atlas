@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises'
 import { AtlasInputError, AtlasNotFoundError, AtlasStore } from './src/server/store.js'
 
 export const name = 'atlas'
-export const inject = ['webServer', 'sessions', 'sessionQuery']
+export const inject = ['webServer', 'sessions', 'sessionQuery', 'llm']
 
 const MAX_BODY_BYTES = 64 * 1024
 
@@ -55,6 +55,12 @@ export function apply(ctx, config = {}) {
       const summary = /^\/atlas\/api\/conversations\/([^/]+)\/summary$/.exec(path)
       if (summary !== null && req.method === 'GET') return sendJson(res, 200, { summary: await store.conversationSummary(decodeURIComponent(summary[1])) })
       if (summary !== null && req.method === 'PUT') return sendJson(res, 200, { summary: await store.saveConversationSummary(decodeURIComponent(summary[1]), await readJson(req)) })
+      if (summary !== null && req.method === 'POST') {
+        const rootSessionId = decodeURIComponent(summary[1])
+        const body = await readJson(req)
+        const generated = await generateConversationSummary(ctx.llm, rootSessionId, body)
+        return sendJson(res, 200, { summary: await store.saveConversationSummary(rootSessionId, { revision: body.revision, ...generated }) })
+      }
       const detail = /^\/atlas\/api\/cards\/([^/]+)$/.exec(path)
       if (detail !== null && req.method === 'GET') return sendJson(res, 200, await store.cardDetail(decodeURIComponent(detail[1])))
       const position = /^\/atlas\/api\/cards\/([^/]+)\/position$/.exec(path)
@@ -83,9 +89,7 @@ export function apply(ctx, config = {}) {
 
   ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/atlas', handler: (_req, res) => redirect(res, '/atlas/') }), 'atlas: redirect')
   ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/atlas/', handler: async (_req, res) => sendFile(res, 'text/html; charset=utf-8', await page()) }), 'atlas: page')
-  ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/atlas/assets/atlas.js', handler: async (_req, res) => sendFile(res, 'text/javascript; charset=utf-8', await asset('assets/atlas.js')) }), 'atlas: app')
-  ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/atlas/assets/style.css', handler: async (_req, res) => sendFile(res, 'text/css; charset=utf-8', await asset('assets/style.css')) }), 'atlas: styles')
-  ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/atlas/assets/three.min.js', handler: async (_req, res) => sendFile(res, 'text/javascript; charset=utf-8', await asset('three.min.js')) }), 'atlas: legacy three renderer')
+  ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: '/atlas/assets', handler: staticAsset }), 'atlas: static assets')
   ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: '/atlas/api', handler: api }), 'atlas: api')
 }
 
@@ -105,6 +109,20 @@ async function projectColdSessions(sessionQuery, store) {
 
 async function asset(path) { return readFile(new URL(`./dist/${path}`, import.meta.url), 'utf8') }
 async function page() { return (await asset('index.html')).replaceAll('"/assets/', '"/atlas/assets/') }
+async function staticAsset(req, res) {
+  const pathname = new URL(req.url ?? '/', 'http://atlas.local').pathname
+  const filename = pathname.slice('/atlas/assets/'.length)
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*\.(?:js|css|mjs)$/.test(filename)) return sendJson(res, 404, { error: '资源不存在' })
+  try {
+    return sendFile(res, assetContentType(filename), await asset(`assets/${filename}`))
+  } catch (error) {
+    if (error?.code === 'ENOENT') return sendJson(res, 404, { error: '资源不存在' })
+    throw error
+  }
+}
+function assetContentType(filename) {
+  return filename.endsWith('.css') ? 'text/css; charset=utf-8' : 'text/javascript; charset=utf-8'
+}
 async function readJson(req) {
   const chunks = []
   let length = 0
@@ -130,4 +148,26 @@ function hostnameOf(authority) {
 function sessionIdForCard(id) {
   const match = /^(.*):(?:turn:\d+|session)$/.exec(id)
   return match?.[1] ?? id
+}
+async function generateConversationSummary(llm, rootSessionId, body) {
+  const transcript = typeof body?.transcript === 'string' ? body.transcript.trim().slice(0, 16_000) : ''
+  const revision = typeof body?.revision === 'string' ? body.revision.trim() : ''
+  const selection = body?.selection
+  if (transcript === '') throw new AtlasInputError('没有可用于生成摘要的对话内容')
+  if (revision === '') throw new AtlasInputError('摘要版本无效')
+  if (typeof selection?.provider !== 'string' || selection.provider.trim() === '' || typeof selection?.model !== 'string' || selection.model.trim() === '') throw new AtlasInputError('请选择可用模型后再更新摘要')
+  if (typeof llm?.stream !== 'function') throw new Error('当前 DSH 服务未启用 LLM 摘要能力')
+  const chunks = new Map()
+  const finished = new Map()
+  const prompt = `你是 DSH Atlas 的会话摘要器。只根据下面的对话投影，输出一条不超过 90 个汉字的中文摘要，交代目标、最新有效进展和未完成的下一步（若有）。不要使用 Markdown、标题、引号或“摘要：”前缀。\n\n对话投影：\n${transcript}`
+  const options = { provider: selection.provider.trim(), model: selection.model.trim(), ...(typeof selection.reasoningEffort === 'string' && selection.reasoningEffort.trim() !== '' ? { reasoningEffort: selection.reasoningEffort.trim() } : {}), messages: [{ id: `atlas-summary-${Date.now()}`, role: 'user', content: [{ type: 'text', text: prompt }], source: { kind: 'plugin', plugin: 'dsh-atlas' } }], maxTokens: 180, sessionId: rootSessionId, purpose: 'session-title' }
+  for await (const chunk of llm.stream(options)) {
+    const index = Number.isInteger(chunk?.index) ? chunk.index : 0
+    if (chunk?.type === 'text-delta') chunks.set(index, `${chunks.get(index) ?? ''}${String(chunk.text ?? chunk.delta ?? '')}`)
+    if (chunk?.type === 'block-end' && chunk.block?.type === 'text' && typeof chunk.block.text === 'string') finished.set(index, chunk.block.text)
+    if (chunk?.type === 'error') throw new Error(chunk.error?.message ?? '摘要生成失败')
+  }
+  const text = [...(finished.size > 0 ? finished : chunks).entries()].sort(([a], [b]) => a - b).map(([, value]) => value).join('').replace(/\s+/g, ' ').trim().slice(0, 360)
+  if (text === '') throw new Error('模型没有返回可用摘要')
+  return { text, provider: options.provider, model: options.model }
 }

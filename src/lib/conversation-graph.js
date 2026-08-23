@@ -1,13 +1,16 @@
 export const DEFAULT_CARD_SIZE = { width: 480, height: 340 }
+export const EMPTY_SESSION_CARD_SIZE = { width: 480, height: 390 }
 const CARD_GAP_X = 96
 const CARD_GAP_Y = 64
 
 export function cardSize(card) {
   const width = Number(card?.size?.width)
   const height = Number(card?.size?.height)
+  const isEmptySession = card?.sourceSeq === null && Array.isArray(card?.messages) && card.messages.length === 0
+  const fallback = isEmptySession ? EMPTY_SESSION_CARD_SIZE : DEFAULT_CARD_SIZE
   return {
-    width: Number.isFinite(width) ? Math.max(360, Math.min(820, Math.round(width))) : DEFAULT_CARD_SIZE.width,
-    height: Number.isFinite(height) ? Math.max(250, Math.min(720, Math.round(height))) : DEFAULT_CARD_SIZE.height,
+    width: Number.isFinite(width) ? Math.max(360, Math.min(820, Math.round(width))) : fallback.width,
+    height: Number.isFinite(height) ? Math.max(250, Math.min(720, Math.round(height))) : fallback.height,
   }
 }
 

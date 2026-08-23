@@ -26,10 +26,11 @@ type ModelChoice = { id: string; name: string; description?: string; reasoning?:
 type ModelGroup = { id: string; name: string; models: ModelChoice[] }
 type ModelSelection = { provider: string; model: string; reasoningEffort?: string }
 type ModelDirectory = { current: ModelSelection | null; routable: boolean | null; groups: ModelGroup[]; failures: { id: string; name: string; message: string }[] }
-type AttachedFile = { id: string; name: string; size: number; text: string }
+type AttachmentKind = 'pdf' | 'word' | 'spreadsheet' | 'text'
+type FileAttachment = { name: string; mime: string; size: number; kind: AttachmentKind; extractedChars: number; truncated: boolean }
 type CommandDescriptor = { name: string; description: string; input?: { hint: string } }
 type SkillDescriptor = { name: string; description?: string; userInvocable?: boolean }
-type ContextItem = { id: string; kind: 'file' | 'card' | 'tool' | 'skill'; label: string; detail: string; content: string }
+type ContextItem = { id: string; kind: 'file' | 'card' | 'tool' | 'skill'; label: string; detail: string; content: string; attachment?: FileAttachment }
 type DeleteMode = 'single' | 'subtree'
 type DeleteState = { card: Card; mode: DeleteMode; successorId?: string }
 type UndoNotice = { operationId: string; count: number; title: string }
@@ -70,6 +71,7 @@ export function App() {
   const [draft, setDraft] = useState('')
   const [busy, setBusy] = useState(false)
   const [loading, setLoading] = useState(!isDevPreview)
+  const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState('')
   const [hostDark, setHostDark] = useState(false)
   const [themeOverride, setThemeOverride] = useState<ThemeOverride>(readThemeOverride)
@@ -98,6 +100,8 @@ export function App() {
   const activeSessionRef = useRef(activeSession)
   const nativeSessionRef = useRef('')
   const loadVersion = useRef(0)
+  const loadAbort = useRef<AbortController | null>(null)
+  const hasLoaded = useRef(isDevPreview)
   const undoTimer = useRef<number | null>(null)
   const summaryRequest = useRef(0)
   cardsRef.current = cards
@@ -121,9 +125,13 @@ export function App() {
   }, [])
   const load = useCallback(async () => {
     const version = ++loadVersion.current
-    setLoading(true)
+    loadAbort.current?.abort()
+    const controller = new AbortController()
+    loadAbort.current = controller
+    const initial = !hasLoaded.current
+    if (initial) setLoading(true); else setRefreshing(true)
     try {
-      const response = await fetch('/atlas/api/conversations')
+      const response = await fetch('/atlas/api/conversations', { signal: controller.signal })
       if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error ?? '无法读取对话投影')
       const data = await response.json() as { cards: Card[]; workspaces: Workspace[] }
       if (version !== loadVersion.current) return
@@ -132,12 +140,13 @@ export function App() {
         setWorkspaces(data.workspaces)
         setCwd(value => value || data.workspaces[0]?.cwd || '')
       }
+      hasLoaded.current = true
     } catch (reason) {
-      if (version === loadVersion.current && !isDevPreview) setError(reason instanceof Error ? reason.message : '无法读取对话投影')
-    } finally { if (version === loadVersion.current) setLoading(false) }
+      if (version === loadVersion.current && !isDevPreview && !(reason instanceof DOMException && reason.name === 'AbortError')) setError(reason instanceof Error ? reason.message : '无法读取对话投影')
+    } finally { if (version === loadVersion.current) { if (initial) setLoading(false); setRefreshing(false) } }
   }, [])
 
-  useEffect(() => { void load() }, [load])
+  useEffect(() => { void load(); return () => loadAbort.current?.abort() }, [load])
   useEffect(() => {
     const receive = (event: MessageEvent) => {
       if (event.origin !== location.origin || event.data?.source !== 'dsh-atlas') return
@@ -170,7 +179,6 @@ export function App() {
       if (data.type === 'atlas:command-directory') settle(data.requestId, Array.isArray(data.commands) ? data.commands : [])
       if (data.type === 'atlas:skill-directory') settle(data.requestId, Array.isArray(data.skills) ? data.skills : [])
       if (data.type === 'atlas:command-ran') settle(data.requestId, data.result)
-      if (data.type === 'atlas:conversation-summary') settle(data.requestId, data.summary)
       if (data.type === 'atlas:map-opened') { setDetail(null); setDraft(''); setSummaryRefreshVersion(value => value + 1); window.setTimeout(() => focusRef.current(), 0) }
     }
     window.addEventListener('message', receive); post('atlas:ready')
@@ -236,11 +244,10 @@ export function App() {
         if (cached) setConversationSummary(cached)
         if (cached?.revision === revision) return
         setSummaryRefreshing(true)
-        const generated = await rpc('atlas:generate-summary', { sessionId: activeSession || resolvedCanvasRoot, transcript: conversationTranscript(canvasCards) }) as { text?: unknown; provider?: unknown; model?: unknown }
-        const text = typeof generated?.text === 'string' ? generated.text.trim() : ''
-        if (text === '') throw new Error('模型没有返回可用摘要')
-        const response = await fetch(`/atlas/api/conversations/${encodeURIComponent(resolvedCanvasRoot)}/summary`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ revision, text, provider: typeof generated.provider === 'string' ? generated.provider : undefined, model: typeof generated.model === 'string' ? generated.model : undefined }) })
-        if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error ?? '无法缓存会话摘要')
+        const directory = await rpc('atlas:get-models', { sessionId: activeSession || resolvedCanvasRoot }) as ModelDirectory
+        if (!directory.current) throw new Error('请先为该对话选择可用模型')
+        const response = await fetch(`/atlas/api/conversations/${encodeURIComponent(resolvedCanvasRoot)}/summary`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ revision, transcript: conversationTranscript(canvasCards), selection: directory.current }) })
+        if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error ?? '无法生成会话摘要')
         const body = await response.json() as { summary: ConversationSummary }
         if (isCurrent()) setConversationSummary(body.summary)
       } catch (reason) {
@@ -440,24 +447,24 @@ export function App() {
 
   return <main className={`atlas-shell ${dark ? 'atlas-dark' : ''}`}>
     <header className="atlas-topbar"><div className="atlas-brand"><span className="atlas-mark">A</span><span>DSH Atlas</span></div><div className="atlas-search atlas-search-mobile"><Search className="size-4" /><input value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索标题、对话、工具与待办" aria-label="搜索会话历史" /></div><div className="atlas-topbar-actions"><button className="atlas-theme-switch" type="button" role="switch" aria-checked={dark} onClick={toggleTheme} aria-label="切换深色或浅色主题" title={dark ? '切换为浅色主题' : '切换为深色主题'}><Sun className="atlas-theme-sun size-3.5" /><Moon className="atlas-theme-moon size-3.5" /><span className="atlas-theme-knob" /></button></div></header>
-    <div className="atlas-layout"><aside className="atlas-sidebar"><Button size="sm" className="w-full justify-start" onClick={() => { setCompose({ kind: 'new' }); setDraft('') }}><Plus className="size-4" />新建对话</Button><div className="atlas-search atlas-search-sidebar"><Search className="size-4" /><input value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索标题、对话、工具与待办" aria-label="搜索会话历史" /></div><div className="atlas-filter-row" role="group" aria-label="筛选画布卡片">{FILTER_OPTIONS.map(item => <button key={item.id} type="button" className={filter === item.id ? 'is-active' : ''} onClick={() => setFilter(item.id)}>{item.label}</button>)}</div><div className="atlas-section-title"><span>工作目录</span></div>{dshWorkspaces.length > 0 ? <select className="atlas-workspace-select" value={selectedDshWorkspaceId} onChange={event => { const workspace = dshWorkspaces.find(item => item.id === event.target.value); setSelectedDshWorkspaceId(event.target.value); setCwd(workspace?.path ?? ''); setDetail(null); setCanvasRootSession('') }}>{dshWorkspaces.map(item => <option key={item.id} value={item.id}>{item.title} · {item.sessionIds.length}</option>)}</select> : <select className="atlas-workspace-select" value={cwd} onChange={event => { setCwd(event.target.value); setDetail(null); setCanvasRootSession('') }}>{workspaces.map(item => <option key={item.cwd} value={item.cwd}>{item.title} · {item.sessionCount}</option>)}</select>}<div className="atlas-section-title atlas-session-heading"><span>{searchActive ? '搜索到的会话' : '会话'}</span><div className="atlas-session-heading-actions">{sidebarDeleteMode ? <><button type="button" className="atlas-select-all" onClick={toggleAllSidebarSelections}>{allSidebarSelected ? '取消全选' : '全选'}</button><span>{selectedSidebarNodes.length}/{sidebarSessionCount}</span><button type="button" className="atlas-session-delete-trigger" onClick={exitSidebarDeleteMode} aria-label="取消批量删除" title="取消"><X className="size-3.5" /></button><button type="button" className="atlas-session-delete-trigger is-danger" disabled={selectedSidebarNodes.length === 0} onClick={() => setSidebarDeleteConfirm(true)} aria-label="删除已选会话" title="删除已选"><Trash2 className="size-3.5" /></button></> : <><span>{sidebarSessionCount}</span><button type="button" className="atlas-session-delete-trigger" onClick={() => { setSidebarDeleteMode(true); setSelectedSessionIds(new Set()) }} aria-label="批量删除会话" title="批量删除会话"><Trash2 className="size-3.5" /></button></>}</div></div><nav className="atlas-nav" aria-label={searchActive ? '搜索到的会话历史' : '会话与分支'}>{sidebarTree.map(node => <SessionNav key={node.id} node={node} activeSession={activeSession} canvasRoot={resolvedCanvasRoot} expanded={expandedSessions} onToggle={id => setExpandedSessions(value => { const next = new Set(value); if (next.has(id)) next.delete(id); else next.add(id); return next })} onSelect={selectSession} selectionMode={sidebarDeleteMode} selectedSessionIds={selectedSessionIds} onSelectForDelete={toggleSidebarSelection} />)}{searchActive && sidebarTree.length === 0 && <p className="atlas-nav-empty">没有匹配的会话历史</p>}</nav>{canvasTasks.length > 0 && <section className="atlas-task-list" aria-label="当前画布待办"><div className="atlas-section-title"><span>待办</span><span>{canvasTasks.length}</span></div>{canvasTasks.slice(0, 8).map(({ task, card }) => <button type="button" key={task.id} onClick={() => void open(card)} title={`定位到「${card.title}」`}><ListTodo className="size-3.5" /><span>{task.content}</span><em>{task.status}</em></button>)}</section>}</aside>
-      <section className="atlas-stage-wrap"><div className="atlas-stage-header"><div className="atlas-conversation-brief" tabIndex={0}><span>AI 摘要</span><p title={historyBrief}>{historyBrief}</p><div className="atlas-brief-popover" role="tooltip">{historyBrief}</div><small>{summaryRefreshing ? '正在根据会话历史更新摘要 · ' : ''}{searchActive ? `${matchingCards.length} / ${graph.cards.length} 张命中` : `${graph.cards.length} 张可见卡片`} · {branchCount} 个分支 · 可续问、折叠与移动</small></div><div className="atlas-stage-actions"><Button className="atlas-arrange-button" variant="outline" size="sm" onClick={arrange}>整理节点</Button><Button className="atlas-mobile-new" size="sm" onClick={() => { setCompose({ kind: 'new' }); setDraft('') }}><Plus className="size-3.5" />新建</Button><Button variant="outline" size="sm" onClick={focusActive}><Focus className="size-3.5" />定位</Button><div className="atlas-zoom"><button onClick={() => zoomAt(scale - .1)} aria-label="缩小"><Minus className="size-3.5" /></button><input value={zoomText} inputMode="numeric" aria-label="画布缩放百分比" onChange={event => setZoomText(event.target.value.replace(/[^0-9.]/g, ''))} onBlur={() => commitZoom()} onKeyDown={event => { if (event.key === 'Enter') { event.currentTarget.blur(); commitZoom(event.currentTarget.value) } }} /><span>%</span><button onClick={() => zoomAt(scale + .1)} aria-label="放大"><Plus className="size-3.5" /></button></div></div></div>
+    <div className="atlas-layout"><aside className="atlas-sidebar"><button type="button" className="atlas-new-session" onClick={() => { setCompose({ kind: 'new' }); setDraft('') }}><Plus className="size-3.5" /><span>新会话</span></button><div className="atlas-search atlas-search-sidebar"><Search className="size-4" /><input value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索标题、对话、工具与待办" aria-label="搜索会话历史" /></div><div className="atlas-filter-row" role="group" aria-label="筛选画布卡片">{FILTER_OPTIONS.map(item => <button key={item.id} type="button" className={filter === item.id ? 'is-active' : ''} onClick={() => setFilter(item.id)}>{item.label}</button>)}</div><div className="atlas-section-title"><span>工作目录</span></div>{dshWorkspaces.length > 0 ? <select className="atlas-workspace-select" value={selectedDshWorkspaceId} onChange={event => { const workspace = dshWorkspaces.find(item => item.id === event.target.value); setSelectedDshWorkspaceId(event.target.value); setCwd(workspace?.path ?? ''); setDetail(null); setCanvasRootSession('') }}>{dshWorkspaces.map(item => <option key={item.id} value={item.id}>{item.title} · {item.sessionIds.length}</option>)}</select> : <select className="atlas-workspace-select" value={cwd} onChange={event => { setCwd(event.target.value); setDetail(null); setCanvasRootSession('') }}>{workspaces.map(item => <option key={item.cwd} value={item.cwd}>{item.title} · {item.sessionCount}</option>)}</select>}<div className="atlas-section-title atlas-session-heading"><span>{searchActive ? '搜索到的会话' : '会话'}</span><div className="atlas-session-heading-actions">{sidebarDeleteMode ? <><button type="button" className="atlas-select-all" onClick={toggleAllSidebarSelections}>{allSidebarSelected ? '取消全选' : '全选'}</button><span>{selectedSidebarNodes.length}/{sidebarSessionCount}</span><button type="button" className="atlas-session-delete-trigger" onClick={exitSidebarDeleteMode} aria-label="取消批量删除" title="取消"><X className="size-3.5" /></button><button type="button" className="atlas-session-delete-trigger is-danger" disabled={selectedSidebarNodes.length === 0} onClick={() => setSidebarDeleteConfirm(true)} aria-label="删除已选会话" title="删除已选"><Trash2 className="size-3.5" /></button></> : <><span>{sidebarSessionCount}</span><button type="button" className="atlas-session-delete-trigger" onClick={() => { setSidebarDeleteMode(true); setSelectedSessionIds(new Set()) }} aria-label="批量删除会话" title="批量删除会话"><Trash2 className="size-3.5" /></button></>}</div></div><nav className="atlas-nav" aria-label={searchActive ? '搜索到的会话历史' : '会话与分支'}>{sidebarTree.map(node => <SessionNav key={node.id} node={node} activeSession={activeSession} canvasRoot={resolvedCanvasRoot} expanded={expandedSessions} onToggle={id => setExpandedSessions(value => { const next = new Set(value); if (next.has(id)) next.delete(id); else next.add(id); return next })} onSelect={selectSession} selectionMode={sidebarDeleteMode} selectedSessionIds={selectedSessionIds} onSelectForDelete={toggleSidebarSelection} />)}{searchActive && sidebarTree.length === 0 && <p className="atlas-nav-empty">没有匹配的会话历史</p>}</nav>{canvasTasks.length > 0 && <section className="atlas-task-list" aria-label="当前画布待办"><div className="atlas-section-title"><span>待办</span><span>{canvasTasks.length}</span></div>{canvasTasks.slice(0, 8).map(({ task, card }) => <button type="button" key={task.id} onClick={() => void open(card)} title={`定位到「${card.title}」`}><ListTodo className="size-3.5" /><span>{task.content}</span><em>{task.status}</em></button>)}</section>}</aside>
+      <section className="atlas-stage-wrap"><div className="atlas-stage-header"><div className="atlas-conversation-brief" tabIndex={0}><span>AI 摘要</span><p title={historyBrief}>{historyBrief}</p><div className="atlas-brief-popover" role="tooltip">{historyBrief}</div><small>{summaryRefreshing ? '正在根据会话历史更新摘要 · ' : ''}{refreshing && <span className="atlas-refresh-status"><LoaderCircle className="size-3 animate-spin" />后台同步中</span>}{searchActive ? `${matchingCards.length} / ${graph.cards.length} 张命中` : `${graph.cards.length} 张可见卡片`} · {branchCount} 个分支 · 可续问、折叠与移动</small></div><div className="atlas-stage-actions"><Button className="atlas-arrange-button" variant="outline" size="sm" onClick={arrange}>整理节点</Button><Button className="atlas-mobile-new" size="sm" onClick={() => { setCompose({ kind: 'new' }); setDraft('') }}><Plus className="size-3.5" />新建</Button><Button variant="outline" size="sm" onClick={focusActive}><Focus className="size-3.5" />定位</Button><div className="atlas-zoom"><button onClick={() => zoomAt(scale - .1)} aria-label="缩小"><Minus className="size-3.5" /></button><input value={zoomText} inputMode="numeric" aria-label="画布缩放百分比" onChange={event => setZoomText(event.target.value.replace(/[^0-9.]/g, ''))} onBlur={() => commitZoom()} onKeyDown={event => { if (event.key === 'Enter') { event.currentTarget.blur(); commitZoom(event.currentTarget.value) } }} /><span>%</span><button onClick={() => zoomAt(scale + .1)} aria-label="放大"><Plus className="size-3.5" /></button></div></div></div>
         {error && <div className="atlas-error" role="alert"><span>{error}</span><button onClick={() => setError('')}>关闭</button></div>}
         <div ref={stage} className="atlas-stage" onPointerDown={event => { if (!(event.target as HTMLElement).closest('[data-card]')) { pan.current = { x: event.clientX, y: event.clientY, offset }; event.currentTarget.setPointerCapture(event.pointerId) } }} onPointerMove={move} onPointerUp={stop} onPointerCancel={stop} onWheel={event => { if ((event.target as HTMLElement).closest('[data-card]')) return; event.preventDefault(); zoomAt(scale + (event.deltaY < 0 ? .08 : -.08), event.clientX, event.clientY) }}>
-          <div className="atlas-grid" />{loading && <div className="atlas-empty"><LoaderCircle className="size-5 animate-spin" />正在同步 DSH 对话…</div>}{!loading && workspaceCards.length === 0 && <div className="atlas-empty"><MessageSquareText className="size-6" /><strong>当前工作区还没有可整理的对话</strong><span>在 DSH 中开始一次对话，Atlas 会自动生成卡片。</span></div>}
+          <div className="atlas-grid" />{loading && workspaceCards.length === 0 && <div className="atlas-empty"><LoaderCircle className="size-5 animate-spin" />正在同步 DSH 对话…</div>}{!loading && workspaceCards.length === 0 && <div className="atlas-empty"><MessageSquareText className="size-6" /><strong>当前工作区还没有可整理的对话</strong><span>在 DSH 中开始一次对话，Atlas 会自动生成卡片。</span></div>}
           <div className="atlas-world" style={{ transform: `translate(${offset.x}px, ${offset.y}px) scale(${scale})` }}>
             <svg className="atlas-connections" width="3600" height="2400" aria-hidden="true">
               {graph.cards.map(card => { const parent = card.parentCardId && canvasCards.find(item => item.id === card.parentCardId); const from = parent && positions.get(parent.id); const to = positions.get(card.id)!; const preview = deletePreviewIds.has(card.id) || (card.parentCardId ? deletePreviewIds.has(card.parentCardId) : false); const matched = searchActive && (matchingIds.has(card.id) || Boolean(card.parentCardId && matchingIds.has(card.parentCardId))); return from && parent ? <path key={card.id} d={connectorPath(from, to, card.parentSessionId !== null, cardSize(parent), cardSize(card))} className={`${card.parentSessionId ? 'atlas-connection is-branch' : 'atlas-connection'} ${preview ? 'is-delete-preview' : ''} ${matched ? 'is-search-match' : ''}`} /> : null })}
               {reconnectPreview.map(({ fromId, child }) => { const parent = canvasCards.find(card => card.id === fromId); const from = positions.get(fromId); const to = positions.get(child.id); return from && to && parent ? <path key={`preview:${child.id}`} d={connectorPath(from, to, child.parentSessionId !== null, cardSize(parent), cardSize(child))} className="atlas-connection is-reconnect-preview" /> : null })}
               {composeAnchor && composePoint && positions.get(composeAnchor.id) && <path d={draftConnector(positions.get(composeAnchor.id)!, composePoint, cardSize(composeAnchor), DEFAULT_CARD_SIZE)} className="atlas-connection is-draft" />}
             </svg>
-            {graph.cards.map(card => <CardView key={card.id} card={card} point={positions.get(card.id)!} active={card.sessionId === activeSession} deleting={deletePreviewIds.has(card.id)} matched={searchActive && matchingIds.has(card.id)} live={live[card.sessionId]} childCount={graph.childCounts.get(card.id) ?? 0} collapsed={collapsed.has(card.id)} canContinue={continuableCardIds.has(card.id)} onOpen={() => void open(card)} onDrag={event => beginDrag(event, card)} onResize={(event, edge) => beginResize(event, card, edge)} onContinue={() => { setCompose({ kind: 'continue', card }); setDraft('') }} onBranch={() => { setCompose({ kind: 'branch', card }); setDraft('') }} onOpenDsh={() => post('atlas:open-session', { sessionId: card.sessionId })} onArchive={() => requestArchive(card)} onDelete={() => requestDelete(card)} onMarker={marker => void saveMarker(card, marker)} onFilter={setFilter} onToggle={() => toggleChildren(card.id)} />)}
+            {graph.cards.map(card => <CardView key={card.id} card={card} point={positions.get(card.id)!} active={card.sessionId === activeSession} deleting={deletePreviewIds.has(card.id)} matched={searchActive && matchingIds.has(card.id)} live={live[card.sessionId]} childCount={graph.childCounts.get(card.id) ?? 0} collapsed={collapsed.has(card.id)} canContinue={continuableCardIds.has(card.id)} draft={draft} setDraft={setDraft} busy={busy} fallbackModel={nativeModel} rpc={rpc} contextCards={canvasCards} onOpen={() => void open(card)} onDrag={event => beginDrag(event, card)} onResize={(event, edge) => beginResize(event, card, edge)} onContinue={() => { setCompose({ kind: 'continue', card }); setDraft('') }} onBranch={() => { setCompose({ kind: 'branch', card }); setDraft('') }} onSend={text => continueConversation(card.sessionId, text)} onCommand={line => runCommand(card.sessionId, line)} onOpenDsh={() => post('atlas:open-session', { sessionId: card.sessionId })} onArchive={() => requestArchive(card)} onDelete={() => requestDelete(card)} onMarker={marker => void saveMarker(card, marker)} onFilter={setFilter} onToggle={() => toggleChildren(card.id)} />)}
             {compose && composePoint && <DraftCardView compose={compose} point={composePoint} draft={draft} setDraft={setDraft} busy={busy} fallbackModel={nativeModel} rpc={rpc} contextCards={canvasCards} onCancel={() => { if (!busy) { setCompose(null); setDraft('') } }} onSubmit={text => submitCompose(text)} onCommand={line => compose.kind === 'new' ? Promise.resolve(null) : runCommand(compose.card.sessionId, line)} />}
           </div>
         </div>
       </section>
     </div>
-    <Dialog open={detail !== null} onOpenChange={value => { if (!value) { setDetail(null); setDraft('') } }}><DialogContent className="atlas-detail-dialog max-h-[min(880px,calc(100vh-24px))] overflow-hidden"><div className="flex max-h-[calc(100vh-58px)] flex-col pr-7">{detail && <><div className="mb-3 flex gap-2"><Badge>{detail.parentSessionId ? '分支' : '会话'}</Badge><Badge>{detail.tools} 次工具</Badge></div><DialogTitle className="text-xl font-semibold tracking-tight text-[var(--fg-2)]">{detail.title}</DialogTitle><div className="atlas-detail-messages mt-4">{detail.messages.length ? detail.messages.map(message => <MessageView key={`${message.sourceSeq}:${message.kind}`} message={message} dark={dark} />) : <MarkdownText text={live[detail.sessionId] || detail.summary} />}{live[detail.sessionId] && <div className="atlas-detail-message is-assistant is-live"><span>DSH · 回复中</span><MarkdownText text={live[detail.sessionId]} /></div>}</div><div className="mt-4 flex flex-wrap justify-end gap-2"><Button variant="outline" onClick={() => { setDetail(null); setCompose({ kind: 'branch', card: detail }); setDraft('') }}><GitBranch className="size-3.5" />从此回答分支</Button><Button variant="outline" onClick={() => post('atlas:open-session', { sessionId: detail.sessionId })}>在 DSH 中打开</Button></div><NativeComposer sessionId={detail.sessionId} draft={draft} setDraft={setDraft} busy={busy} fallbackModel={nativeModel} rpc={rpc} contextCards={canvasCards} sourceCard={detail} onSend={text => continueConversation(detail.sessionId, text)} onCommand={line => runCommand(detail.sessionId, line)} /></>}</div></DialogContent></Dialog>
+    <Dialog open={detail !== null} onOpenChange={value => { if (!value) { setDetail(null); setDraft('') } }}><DialogContent className="atlas-detail-dialog"><div className="atlas-detail-content">{detail && <><header className="atlas-detail-header"><div className="flex gap-2"><Badge>{detail.parentSessionId ? '分支' : '会话'}</Badge><Badge>{detail.tools} 次工具</Badge></div><DialogTitle className="atlas-detail-title">对话详情</DialogTitle><p className="atlas-detail-subtitle" title={detail.title}>{previewText(detail.title)}</p></header><div className="atlas-detail-messages">{detail.messages.length ? detail.messages.map(message => <MessageView key={`${message.sourceSeq}:${message.kind}`} message={message} dark={dark} />) : <MarkdownText text={live[detail.sessionId] || detail.summary} />}{live[detail.sessionId] && <div className="atlas-detail-message is-assistant is-live"><span>DSH · 回复中</span><MarkdownText text={live[detail.sessionId]} /></div>}</div><footer className="atlas-detail-actions"><Button variant="outline" onClick={() => { setDetail(null); setCompose({ kind: 'branch', card: detail }); setDraft('') }}><GitBranch className="size-3.5" />从此回答分支</Button><Button variant="outline" onClick={() => post('atlas:open-session', { sessionId: detail.sessionId })}>在 DSH 中打开</Button></footer></>}</div></DialogContent></Dialog>
     <Dialog open={deletion !== null} onOpenChange={value => { if (!value && !deleting) setDeletion(null) }}><DialogContent className="atlas-delete-dialog"><div className="pr-7">{deletion && deletePlan && <><div className="atlas-delete-icon"><Trash2 className="size-5" /></div><DialogTitle className="mt-3 text-xl text-[var(--fg-2)]">删除卡片节点</DialogTitle><p className="atlas-delete-intro">选择如何处理“{deletion.card.title}”。操作只影响 Atlas 画布，DSH 原始对话会保留。</p><div className="atlas-delete-options" role="radiogroup" aria-label="删除范围"><button type="button" role="radio" aria-checked={deletion.mode === 'single'} className={deletion.mode === 'single' ? 'is-selected' : ''} onClick={() => setDeletion(value => value ? { ...value, mode: 'single' } : value)}><span className="atlas-delete-radio" /><span><strong>仅删除当前节点</strong><small>{deletePlan.directChildren.length > 0 ? `后续 ${deletePlan.directChildren.length} 个直接节点将自动接到上一个节点` : '删除这一张卡片，不影响其它节点'}</small></span></button>{deletePlan.descendants.length > 1 && <button type="button" role="radio" aria-checked={deletion.mode === 'subtree'} className={deletion.mode === 'subtree' ? 'is-selected is-danger' : ''} onClick={() => setDeletion(value => value ? { ...value, mode: 'subtree' } : value)}><span className="atlas-delete-radio" /><span><strong>删除此节点及所有后续</strong><small>共 {deletePlan.descendants.length} 张卡片{deletePlan.branchCount > 0 ? `、${deletePlan.branchCount} 个分支` : ''}，主线和分支后续都会删除</small></span></button>}</div>{deletion.mode === 'single' && !deletePlan.target.parentCardId && !deletePlan.mainSuccessor && deletePlan.directChildren.length > 1 && <label className="atlas-successor-field"><span>选择新的起始节点</span><select value={deletion.successorId ?? ''} onChange={event => setDeletion(value => value ? { ...value, successorId: event.target.value } : value)}>{deletePlan.directChildren.map(card => <option key={card.id} value={card.id}>{card.title}</option>)}</select><small>其它直接分支会自动连接到这个节点。</small></label>}<div className="atlas-delete-actions"><Button variant="outline" disabled={deleting} onClick={() => setDeletion(null)}>取消</Button><Button className="atlas-danger-button" disabled={deleting} onClick={() => void confirmDelete()}>{deleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}{deletion.mode === 'subtree' ? `删除 ${deletePlan.descendants.length} 张卡片` : '删除当前节点'}</Button></div></>}</div></DialogContent></Dialog>
     <Dialog open={sidebarDeleteConfirm} onOpenChange={value => { if (!value && !sidebarDeleting) setSidebarDeleteConfirm(false) }}><DialogContent className="atlas-delete-dialog"><div className="pr-7"><div className="atlas-delete-icon"><Trash2 className="size-5" /></div><DialogTitle className="mt-3 text-xl text-[var(--fg-2)]">移除 {selectedSidebarNodes.length} 条会话记录</DialogTitle><p className="atlas-delete-intro">将所选会话从 Atlas 侧栏与画布视图移除；DSH 中的原始对话和消息不会被删除。</p><div className="atlas-delete-actions"><Button variant="outline" disabled={sidebarDeleting} onClick={() => setSidebarDeleteConfirm(false)}>取消</Button><Button className="atlas-danger-button" disabled={sidebarDeleting} onClick={() => void confirmSidebarDelete()}>{sidebarDeleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}确认移除</Button></div></div></DialogContent></Dialog>
     <Dialog open={archiveCard !== null} onOpenChange={value => { if (!value && !archiving) setArchiveCard(null) }}><DialogContent className="atlas-delete-dialog"><div className="pr-7">{archiveCard && <><div className="atlas-delete-icon"><Archive className="size-5" /></div><DialogTitle className="mt-3 text-xl text-[var(--fg-2)]">归档当前会话</DialogTitle><p className="atlas-delete-intro">“{archiveCard.title}”及其后续分支将从 Atlas 画布隐藏，但不会删除 DSH 中的原始对话。</p><div className="atlas-delete-actions"><Button variant="outline" disabled={archiving} onClick={() => setArchiveCard(null)}>取消</Button><Button disabled={archiving} onClick={() => void confirmArchive()}>{archiving ? <LoaderCircle className="size-4 animate-spin" /> : <Archive className="size-4" />}归档会话</Button></div></>}</div></DialogContent></Dialog>
@@ -513,11 +520,20 @@ function NativeComposer({ sessionId, draft, setDraft, busy, fallbackModel, rpc, 
   const addFiles = async (list: FileList | null) => {
     if (!list) return
     const next: ContextItem[] = []
-    let total = contextItems.filter(item => item.kind === 'file').reduce((sum, item) => sum + new Blob([item.content]).size, 0)
+    let total = contextItems.filter(item => item.kind === 'file').reduce((sum, item) => sum + (item.attachment?.size ?? new Blob([item.content]).size), 0)
+    let totalText = contextItems.filter(item => item.kind === 'file').reduce((sum, item) => sum + item.content.length, 0)
     for (const file of [...list]) {
-      if (file.size > 256 * 1024 || total + file.size > 512 * 1024) { setModelError('单个文件不能超过 256 KB，合计不能超过 512 KB'); break }
-      try { const text = await file.text(); next.push({ id: crypto.randomUUID(), kind: 'file', label: file.name, detail: formatBytes(file.size), content: text }); total += file.size }
-      catch { setModelError(`无法读取文件：${file.name}`) }
+      if (file.size > MAX_ATTACHMENT_BYTES || total + file.size > MAX_ATTACHMENT_TOTAL_BYTES) { setModelError(`单个文件不能超过 ${formatBytes(MAX_ATTACHMENT_BYTES)}，本次合计不能超过 ${formatBytes(MAX_ATTACHMENT_TOTAL_BYTES)}`); continue }
+      try {
+        const attachment = await extractFileAttachment(file)
+        const remaining = MAX_ATTACHMENT_TOTAL_TEXT_LENGTH - totalText
+        if (remaining < 800) { setModelError(`已达到本次附件可读内容上限（${Math.round(MAX_ATTACHMENT_TOTAL_TEXT_LENGTH / 1000)}k 字符）`); break }
+        const content = attachment.text.slice(0, remaining)
+        const meta = { ...attachment.meta, extractedChars: content.length, truncated: attachment.meta.truncated || content.length < attachment.text.length }
+        next.push({ id: crypto.randomUUID(), kind: 'file', label: attachment.name, detail: `${attachmentLabel(attachment.kind)} · ${formatBytes(attachment.meta.size)}${meta.truncated ? ' · 已截取正文' : ''}`, content, attachment: meta })
+        total += file.size
+        totalText += content.length
+      } catch (reason) { setModelError(reason instanceof Error ? reason.message : `无法读取文件：${file.name}`) }
     }
     setContextItems(value => [...value, ...next])
     if (fileInput.current) fileInput.current.value = ''
@@ -533,7 +549,7 @@ function NativeComposer({ sessionId, draft, setDraft, busy, fallbackModel, rpc, 
       else if (result) setNotice(`${text.split(/\s/, 1)[0]} 已提交给 DSH`)
       return
     }
-    const attached = contextItems.map(item => `\n\n<atlas_context type="${item.kind}" label="${item.label.replaceAll('"', '&quot;')}">\n${item.content}\n</atlas_context>`).join('')
+    const attached = contextItems.map(serializeContextItem).join('')
     await onSend(`${text}${attached}`.trim())
     setContextItems([])
   }
@@ -559,12 +575,12 @@ function NativeComposer({ sessionId, draft, setDraft, busy, fallbackModel, rpc, 
       {menu === 'effort' && <div className="atlas-model-groups">{currentChoice?.model.reasoning?.efforts.map(effort => { const selected = effort.id === currentEffort; return <button type="button" role="menuitemradio" aria-checked={selected} disabled={modelBusy} key={effort.id} onClick={() => void selectModel({ provider: currentChoice.group.id, model: currentChoice.model.id, reasoningEffort: effort.id })}><span><strong>{effort.name}</strong>{effort.description && <small>{effort.description}</small>}</span>{selected && <Check className="size-4" />}</button>})}</div>}
     </div>}
     {commandVisible && <div className="atlas-native-menu atlas-command-help" role="menu" aria-label="DSH 命令目录">{commandError && <div className="atlas-menu-error"><span>{commandError}</span><button type="button" onClick={() => void loadCommands()}>重试</button></div>}{visibleCommands.map(command => <button type="button" role="menuitem" key={command.name} onClick={() => { if (command.name === 'model') { setDraft('/model'); setMenu('model') } else { setDraft(`/${command.name}${command.input ? ' ' : ''}`); setMenu(null) } }}><span><code>/{command.name}</code>{command.description}</span><small>{command.input?.hint ?? '执行命令'}</small></button>)}{!commandError && visibleCommands.length === 0 && <p className="atlas-menu-empty">当前 DSH Profile 没有匹配的命令</p>}</div>}
-    {mentionVisible && <div className="atlas-native-menu atlas-mention-menu" role="menu" aria-label="添加上下文"><button type="button" role="menuitem" onClick={() => fileInput.current?.click()}><Paperclip className="size-4" /><span><strong>选择本地文件</strong><small>把文件内容作为本次上下文</small></span></button>{mentions.map(item => <button type="button" role="menuitem" key={item.id} onClick={() => pickContext(item)}>{item.kind === 'tool' ? <Wrench className="size-4" /> : item.kind === 'skill' ? <Command className="size-4" /> : <FileText className="size-4" />}<span><strong>{item.label}</strong><small>{item.detail}</small></span></button>)}{mentions.length === 0 && <p className="atlas-menu-empty">没有匹配的卡片、工具输出或技能</p>}</div>}
+    {mentionVisible && <div className="atlas-native-menu atlas-mention-menu" role="menu" aria-label="添加上下文"><button type="button" role="menuitem" onClick={() => fileInput.current?.click()}><Paperclip className="size-4" /><span><strong>选择本地文件</strong><small>支持 PDF、Word、Excel 与文本，会提取正文作为本次上下文</small></span></button>{mentions.map(item => <button type="button" role="menuitem" key={item.id} onClick={() => pickContext(item)}>{item.kind === 'tool' ? <Wrench className="size-4" /> : item.kind === 'skill' ? <Command className="size-4" /> : <FileText className="size-4" />}<span><strong>{item.label}</strong><small>{item.detail}</small></span></button>)}{mentions.length === 0 && <p className="atlas-menu-empty">没有匹配的卡片、工具输出或技能</p>}</div>}
     {notice && <div className="atlas-composer-notice"><span>{notice}</span><button type="button" aria-label="关闭状态" onClick={() => setNotice('')}><X className="size-3" /></button></div>}
-    {contextItems.length > 0 && <div className="atlas-attachment-rail" aria-label="已添加的上下文">{contextItems.map(item => <span key={item.id}>{item.kind === 'tool' ? <Wrench className="size-3.5" /> : item.kind === 'skill' ? <Command className="size-3.5" /> : <FileText className="size-3.5" />}{item.label}<button type="button" aria-label={`移除 ${item.label}`} onClick={() => setContextItems(value => value.filter(existing => existing.id !== item.id))}><X className="size-3" /></button></span>)}</div>}
+    {contextItems.length > 0 && <div className="atlas-attachment-rail" aria-label="已添加的上下文">{contextItems.map(item => <span key={item.id} title={item.detail}>{item.kind === 'tool' ? <Wrench className="size-3.5" /> : item.kind === 'skill' ? <Command className="size-3.5" /> : <FileText className="size-3.5" />}<b>{item.label}</b>{item.attachment && <small>{attachmentLabel(item.attachment.kind)}</small>}<button type="button" aria-label={`移除 ${item.label}`} onClick={() => setContextItems(value => value.filter(existing => existing.id !== item.id))}><X className="size-3" /></button></span>)}</div>}
     <textarea className="atlas-native-input" value={draft} onChange={event => { const value = event.target.value; setDraft(value); if (value.match(/(?:^|\s)@[^\s]*$/)) setMenu('mention'); else if (value.trimStart().startsWith('/')) setMenu('command') }} onKeyDown={event => { if (event.key === 'Escape') { setMenu(null); return } if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void submit() } }} placeholder="给智能体发消息；输入 / 命令或 @ 添加上下文" maxLength={16000} disabled={busy} />
     <div className="atlas-native-footer"><div className="atlas-native-left"><button type="button" className="atlas-plus-button" onClick={() => setMenu(menu === 'command' ? null : 'command')} aria-label="打开 DSH 命令"><Plus className="size-4" /></button><button type="button" onClick={() => fileInput.current?.click()} title="选择本地文件"><Paperclip className="size-4" /><span>文件</span></button><button type="button" onClick={() => setMenu(menu === 'mention' ? null : 'mention')} title="添加上下文" aria-label="添加上下文"><AtSign className="size-4" /></button></div><div className="atlas-native-right"><div className="atlas-model-trigger-wrap"><button type="button" className="atlas-model-trigger" onClick={() => setMenu(menu === 'model' ? null : 'model')} aria-haspopup="menu" aria-expanded={menu === 'model' || menu === 'effort'}><Bot className="size-4" /><span>{modelLabel}</span>{effortLabel && <em>{effortLabel}</em>}<ChevronDown className="size-3.5" /></button></div><button className="atlas-send-button" type="submit" disabled={busy || (!draft.trim() && contextItems.length === 0)} aria-label="发送消息">{busy ? <LoaderCircle className="size-4 animate-spin" /> : <Send className="size-4" />}</button></div></div>
-    <input ref={fileInput} className="sr-only" type="file" multiple accept=".txt,.md,.json,.csv,.ts,.tsx,.js,.jsx,.py,.java,.go,.rs,.css,.html,.xml,.yaml,.yml,.toml,.ini,.log" onChange={event => void addFiles(event.target.files)} />
+    <input ref={fileInput} className="sr-only" type="file" multiple accept=".pdf,.docx,.xlsx,.xls,.csv,.txt,.md,.json,.ts,.tsx,.js,.jsx,.py,.java,.go,.rs,.css,.html,.xml,.yaml,.yml,.toml,.ini,.log" onChange={event => void addFiles(event.target.files)} />
   </form>
 }
 
@@ -577,10 +593,12 @@ function DraftCardView({ compose, point, draft, setDraft, busy, fallbackModel, r
   </article>
 }
 
-function CardView({ card, point, active, deleting, matched, live, childCount, collapsed, canContinue, onOpen, onDrag, onResize, onContinue, onBranch, onOpenDsh, onArchive, onDelete, onMarker, onFilter, onToggle }: { card: Card; point: Point; active: boolean; deleting: boolean; matched: boolean; live?: string; childCount: number; collapsed: boolean; canContinue: boolean; onOpen: () => void; onDrag: (event: React.PointerEvent<HTMLElement>) => void; onResize: (event: React.PointerEvent<HTMLElement>, edge: ResizeEdge) => void; onContinue: () => void; onBranch: () => void; onOpenDsh: () => void; onArchive: () => void; onDelete: () => void; onMarker: (marker: Marker) => void; onFilter: (filter: Filter) => void; onToggle: () => void }) {
+function CardView({ card, point, active, deleting, matched, live, childCount, collapsed, canContinue, draft, setDraft, busy, fallbackModel, rpc, contextCards, onOpen, onDrag, onResize, onContinue, onBranch, onSend, onCommand, onOpenDsh, onArchive, onDelete, onMarker, onFilter, onToggle }: { card: Card; point: Point; active: boolean; deleting: boolean; matched: boolean; live?: string; childCount: number; collapsed: boolean; canContinue: boolean; draft: string; setDraft: (value: string | ((previous: string) => string)) => void; busy: boolean; fallbackModel: string; rpc: (type: string, body?: object) => Promise<unknown>; contextCards: Card[]; onOpen: () => void; onDrag: (event: React.PointerEvent<HTMLElement>) => void; onResize: (event: React.PointerEvent<HTMLElement>, edge: ResizeEdge) => void; onContinue: () => void; onBranch: () => void; onSend: (text: string) => Promise<void>; onCommand: (line: string) => Promise<unknown>; onOpenDsh: () => void; onArchive: () => void; onDelete: () => void; onMarker: (marker: Marker) => void; onFilter: (filter: Filter) => void; onToggle: () => void }) {
   const [menuOpen, setMenuOpen] = useState(false)
   const choose = (marker: Marker) => { setMenuOpen(false); onMarker(marker) }
   const canBranch = Number.isInteger(card.branchSeq)
+  const isFreshConversation = card.sourceSeq === null && card.messages.length === 0
+  const fileCount = card.messages.reduce((total, message) => total + splitAttachmentMessage(message.text).attachments.length, 0)
   const size = cardSize(card) as CardSize
   const title = previewText(card.title)
   const summary = previewText(live?.trim() || card.summary)
@@ -591,11 +609,11 @@ function CardView({ card, point, active, deleting, matched, live, childCount, co
     return edge.left || edge.right || edge.top || edge.bottom ? edge : null
   }
   const cursorFor = (edge: ResizeEdge | null) => edge === null ? 'grab' : (edge.left || edge.right) && (edge.top || edge.bottom) ? 'nwse-resize' : edge.left || edge.right ? 'ew-resize' : 'ns-resize'
-  return <article data-card data-card-id={card.id} className={`atlas-card ${active ? 'is-active' : ''} ${card.parentSessionId ? 'is-branch' : ''} ${deleting ? 'is-delete-preview' : ''} ${matched ? 'is-search-match' : ''}`} style={{ left: point.x, top: point.y, width: size.width, height: size.height }} onPointerDown={event => { const edge = edgeAt(event); if (edge) onResize(event, edge); else onDrag(event) }} onPointerMove={event => { event.currentTarget.style.cursor = cursorFor(edgeAt(event)) }} onPointerLeave={event => { event.currentTarget.style.cursor = 'grab' }} onClick={onOpen} title="拖动卡片移动；拖动边框可调整大小">
+  return <article data-card data-card-id={card.id} className={`atlas-card ${isFreshConversation ? 'is-fresh-conversation' : ''} ${active ? 'is-active' : ''} ${card.parentSessionId ? 'is-branch' : ''} ${deleting ? 'is-delete-preview' : ''} ${matched ? 'is-search-match' : ''}`} style={{ left: point.x, top: point.y, width: size.width, height: size.height }} onPointerDown={event => { const edge = edgeAt(event); if (edge) onResize(event, edge); else onDrag(event) }} onPointerMove={event => { event.currentTarget.style.cursor = cursorFor(edgeAt(event)) }} onPointerLeave={event => { event.currentTarget.style.cursor = 'grab' }} onClick={event => { if (!(event.target as HTMLElement).closest('button, a, input, textarea, select, [data-no-drag]')) onOpen() }} title="拖动卡片移动；拖动边框可调整大小">
     {canContinue && <button className="atlas-card-connector atlas-card-continue" onClick={event => { event.stopPropagation(); onContinue() }} aria-label="添加追问" title="添加追问"><Plus className="size-3.5" /></button>}
     {!canContinue && childCount > 0 && <button className="atlas-card-connector atlas-card-fold" onClick={event => { event.stopPropagation(); onToggle() }} aria-label={collapsed ? `展开 ${childCount} 个后续节点` : `折叠 ${childCount} 个后续节点`} title={collapsed ? '展开后续对话' : '折叠后续对话'}>{collapsed ? <CirclePlus className="size-3.5" /> : <CircleMinus className="size-3.5" />}</button>}
     {canBranch && <button className="atlas-card-connector atlas-card-branch" onClick={event => { event.stopPropagation(); onBranch() }} aria-label="从此回答创建分支" title="从此回答创建分支"><GitBranch className="size-3.5" /></button>}
-    <header><div className="flex items-center gap-2"><span className="atlas-card-dot" /><Badge>{card.parentSessionId ? '另一种思路' : '对话'}</Badge>{card.marker.important && <span className="atlas-marker-chip"><Flag className="size-3" />重点</span>}{card.marker.kind !== 'none' && <span className={`atlas-marker-chip is-${card.marker.kind}`}>{markerLabel(card.marker.kind)}</span>}</div><div className="atlas-card-menu-wrap"><button className="atlas-card-menu-trigger" onClick={event => { event.stopPropagation(); setMenuOpen(value => !value) }} aria-label={`打开 ${card.title} 的卡片菜单`} aria-expanded={menuOpen} title="卡片状态与筛选"><MoreHorizontal className="size-4" /></button>{menuOpen && <div className="atlas-card-menu atlas-card-status-menu" role="menu"><div className="atlas-card-menu-label">快速筛选</div>{FILTER_OPTIONS.map(option => <button key={option.id} role="menuitem" className="atlas-card-menu-filter" onClick={event => { event.stopPropagation(); setMenuOpen(false); onFilter(option.id) }}><span>{option.label}</span><small>{option.id === 'tools' ? `${card.tools} 次工具` : option.id === 'todos' ? `${card.todos} 项待办` : '筛选画布'}</small></button>)}<div className="atlas-card-menu-label">卡片状态</div><button role="menuitemcheckbox" aria-checked={card.marker.important} onClick={event => { event.stopPropagation(); choose({ ...card.marker, important: !card.marker.important }) }}><Flag className="size-3.5" />{card.marker.important ? '取消重点' : '标为重点'}</button>{(['conclusion', 'verify'] as MarkerKind[]).map(kind => <button key={kind} role="menuitemradio" aria-checked={card.marker.kind === kind} onClick={event => { event.stopPropagation(); choose({ ...card.marker, kind }) }}><Check className={`size-3.5 ${card.marker.kind === kind ? '' : 'invisible'}`} />{markerLabel(kind)}</button>)}{(card.marker.important || card.marker.kind !== 'none') && <button role="menuitem" onClick={event => { event.stopPropagation(); choose({ important: false, kind: 'none' }) }}><X className="size-3.5" />清除状态</button>}<button role="menuitem" className="is-danger" onClick={event => { event.stopPropagation(); setMenuOpen(false); onDelete() }}><Trash2 className="size-3.5" />删除卡片</button></div>}</div></header><h3 title={card.title}>{title}</h3><div className="atlas-card-summary" title={live?.trim() || card.summary}>{summary}</div><footer className="atlas-card-footer"><span>{card.tools > 0 && <><Wrench className="size-3.5" />{card.tools}</>}{card.todos > 0 && ` · 待办 ${card.todos}`}</span><div className="atlas-card-actions"><button onClick={event => { event.stopPropagation(); onOpen() }}>详情</button><button disabled={!canBranch} onClick={event => { event.stopPropagation(); onBranch() }}>分支</button><button onClick={event => { event.stopPropagation(); onOpenDsh() }}>打开 DSH</button><button onClick={event => { event.stopPropagation(); onArchive() }}>归档</button></div></footer>
+    <header><div className="flex items-center gap-2"><span className="atlas-card-dot" /><Badge>{isFreshConversation ? '新对话' : card.parentSessionId ? '另一种思路' : '对话'}</Badge>{card.marker.important && <span className="atlas-marker-chip"><Flag className="size-3" />重点</span>}{card.marker.kind !== 'none' && <span className={`atlas-marker-chip is-${card.marker.kind}`}>{markerLabel(card.marker.kind)}</span>}</div><div className="atlas-card-menu-wrap"><button className="atlas-card-menu-trigger" onClick={event => { event.stopPropagation(); setMenuOpen(value => !value) }} aria-label={`打开 ${card.title} 的卡片菜单`} aria-expanded={menuOpen} title="卡片状态与筛选"><MoreHorizontal className="size-4" /></button>{menuOpen && <div className="atlas-card-menu atlas-card-status-menu" role="menu"><div className="atlas-card-menu-label">快速筛选</div>{FILTER_OPTIONS.map(option => <button key={option.id} role="menuitem" className="atlas-card-menu-filter" onClick={event => { event.stopPropagation(); setMenuOpen(false); onFilter(option.id) }}><span>{option.label}</span><small>{option.id === 'tools' ? `${card.tools} 次工具` : option.id === 'todos' ? `${card.todos} 项待办` : '筛选画布'}</small></button>)}<div className="atlas-card-menu-label">卡片状态</div><button role="menuitemcheckbox" aria-checked={card.marker.important} onClick={event => { event.stopPropagation(); choose({ ...card.marker, important: !card.marker.important }) }}><Flag className="size-3.5" />{card.marker.important ? '取消重点' : '标为重点'}</button>{(['conclusion', 'verify'] as MarkerKind[]).map(kind => <button key={kind} role="menuitemradio" aria-checked={card.marker.kind === kind} onClick={event => { event.stopPropagation(); choose({ ...card.marker, kind }) }}><Check className={`size-3.5 ${card.marker.kind === kind ? '' : 'invisible'}`} />{markerLabel(kind)}</button>)}{(card.marker.important || card.marker.kind !== 'none') && <button role="menuitem" onClick={event => { event.stopPropagation(); choose({ important: false, kind: 'none' }) }}><X className="size-3.5" />清除状态</button>}<button role="menuitem" className="is-danger" onClick={event => { event.stopPropagation(); setMenuOpen(false); onDelete() }}><Trash2 className="size-3.5" />删除卡片</button></div>}</div></header>{isFreshConversation ? <div className="atlas-fresh-conversation" data-no-drag><h3>开始新对话</h3><p>输入第一条消息以开始当前会话。</p><NativeComposer sessionId={card.sessionId} draft={draft} setDraft={setDraft} busy={busy} fallbackModel={fallbackModel} rpc={rpc} contextCards={contextCards} sourceCard={card} onSend={onSend} onCommand={onCommand} /></div> : <><h3 title={card.title}>{title}</h3><div className="atlas-card-summary" title={live?.trim() || card.summary}>{summary}</div><footer className="atlas-card-footer"><span>{fileCount > 0 && <><FileText className="size-3.5" />{fileCount}</>}{card.tools > 0 && <>{fileCount > 0 && ' · '}<Wrench className="size-3.5" />{card.tools}</>}{card.todos > 0 && ` · 待办 ${card.todos}`}</span><div className="atlas-card-actions"><button onClick={event => { event.stopPropagation(); onOpen() }}>查看详情</button><button onClick={event => { event.stopPropagation(); onOpenDsh() }}>返回 DSH</button><button onClick={event => { event.stopPropagation(); onArchive() }}>存档</button></div></footer></>}
   </article>
 }
 function SessionNav({ node, activeSession, canvasRoot, expanded, onToggle, onSelect, selectionMode, selectedSessionIds, onSelectForDelete, depth = 0 }: { node: SessionNode; activeSession: string; canvasRoot: string; expanded: Set<string>; onToggle: (id: string) => void; onSelect: (card: Card) => void; selectionMode: boolean; selectedSessionIds: Set<string>; onSelectForDelete: (id: string) => void; depth?: number }) {
@@ -610,7 +628,15 @@ function SessionNav({ node, activeSession, canvasRoot, expanded, onToggle, onSel
   </div>
 }
 function MarkdownText({ text, compact = false }: { text: string; compact?: boolean }) { return <div className={`atlas-markdown ${compact ? 'is-compact' : ''}`}><ReactMarkdown remarkPlugins={[remarkGfm]} components={{ a: props => <a {...props} target="_blank" rel="noreferrer" /> }}>{text}</ReactMarkdown></div> }
-function MessageView({ message, dark }: { message: Message; dark: boolean }) { return <div className={`atlas-detail-message is-${message.kind}`}><span>{message.kind === 'user' ? '你的消息' : message.kind === 'assistant' ? 'DSH' : message.kind === 'todo' ? '待办' : '系统'}</span><MarkdownText text={message.text} />{message.process.map(item => isArtifact(item) ? <ArtifactView key={item.callId} item={item} dark={dark} /> : <details key={item.callId} className="atlas-process"><summary>{item.name} · {item.error ? '失败' : item.result === null ? '进行中' : '已完成'}</summary>{item.arguments && <pre>{item.arguments}</pre>}{item.result && <pre>{item.result}</pre>}{item.error && <pre>{item.error}</pre>}</details>)}</div> }
+function MessageView({ message, dark }: { message: Message; dark: boolean }) {
+  const artifacts = message.process.filter(isArtifact)
+  const tools = message.process.filter(item => !isArtifact(item))
+  const attachmentMessage = splitAttachmentMessage(message.text)
+  return <div className={`atlas-detail-message is-${message.kind}`}><span>{message.kind === 'user' ? '你的消息' : message.kind === 'assistant' ? 'DSH' : message.kind === 'todo' ? '待办' : '系统'}</span>{attachmentMessage.body && <MarkdownText text={attachmentMessage.body} />}{attachmentMessage.attachments.length > 0 && <AttachmentList attachments={attachmentMessage.attachments} />}{artifacts.map(item => <ArtifactView key={item.callId} item={item} dark={dark} />)}{tools.length > 0 && <details className="atlas-process-group"><summary>{tools.length} 次工具活动</summary><div>{tools.map(item => <details key={item.callId} className="atlas-process"><summary>{item.name} · {item.error ? '失败' : item.result === null ? '进行中' : '已完成'}</summary>{item.arguments && <pre>{item.arguments}</pre>}{item.result && <pre>{item.result}</pre>}{item.error && <pre>{item.error}</pre>}</details>)}</div></details>}</div>
+}
+function AttachmentList({ attachments }: { attachments: FileAttachment[] }) {
+  return <div className="atlas-message-attachments" aria-label="本条消息附带的文件">{attachments.map((attachment, index) => <div key={`${attachment.name}-${index}`}><FileText className="size-4" /><span><strong>{attachment.name}</strong><small>{attachmentLabel(attachment.kind)} · {attachment.size > 0 ? formatBytes(attachment.size) : '已提取正文'}{attachment.truncated ? ' · 正文已截取' : ''}</small></span></div>)}</div>
+}
 function ArtifactView({ item, dark }: { item: Process; dark: boolean }) {
   const args = useMemo(() => parseToolArguments(item.arguments), [item.arguments])
   const meta = item.meta ?? {}
@@ -771,6 +797,91 @@ function finite(value: unknown, fallback: number) { return Number.isFinite(Numbe
 function number3(value: unknown): [number, number, number] { const items = Array.isArray(value) ? value : []; return [finite(items[0], 0), finite(items[1], 0), finite(items[2], 0)] }
 function validColor(value: unknown) { return typeof value === 'string' && /^(?:#[0-9a-f]{3,8}|[a-z]+)$/i.test(value.trim()) ? value.trim() : null }
 function formatBytes(value: number) { return value < 1024 ? `${value} B` : value < 1024 * 1024 ? `${Math.round(value / 102.4) / 10} KB` : `${Math.round(value / 104857.6) / 10} MB` }
+const MAX_ATTACHMENT_BYTES = 12 * 1024 * 1024
+const MAX_ATTACHMENT_TOTAL_BYTES = 24 * 1024 * 1024
+const MAX_ATTACHMENT_TEXT_LENGTH = 48_000
+const MAX_ATTACHMENT_TOTAL_TEXT_LENGTH = 96_000
+type ExtractedAttachment = { name: string; kind: AttachmentKind; text: string; meta: FileAttachment }
+
+async function extractFileAttachment(file: File): Promise<ExtractedAttachment> {
+  const kind = attachmentKind(file)
+  if (kind === null) {
+    const extension = file.name.split('.').at(-1)?.toLowerCase()
+    if (extension === 'doc') throw new Error(`暂不支持旧版 Word 文档：${file.name}。请另存为 .docx 后再上传`)
+    throw new Error(`暂不支持此文件类型：${file.name}。可上传 PDF、.docx、.xlsx/.xls、CSV 或文本文件`)
+  }
+  let text = ''
+  if (kind === 'pdf') {
+    const [pdfjs, pdfWorker] = await Promise.all([
+      import('pdfjs-dist/legacy/build/pdf.mjs'),
+      import('pdfjs-dist/legacy/build/pdf.worker.mjs?url'),
+    ])
+    pdfjs.GlobalWorkerOptions.workerSrc = pdfWorker.default
+    const document = await pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) } as any).promise
+    const pages: string[] = []
+    for (let number = 1; number <= Math.min(document.numPages, 80); number += 1) {
+      const page = await document.getPage(number)
+      const content = await page.getTextContent()
+      const value = content.items.map(item => 'str' in item ? item.str : '').join(' ').replace(/\s+/g, ' ').trim()
+      if (value) pages.push(`第 ${number} 页\n${value}`)
+      if (pages.join('\n').length >= MAX_ATTACHMENT_TEXT_LENGTH) break
+    }
+    text = pages.join('\n\n')
+    if (text === '') throw new Error(`无法从 ${file.name} 提取可读文本；扫描版 PDF 请先进行 OCR`)
+  } else if (kind === 'word') {
+    const mammoth = await import('mammoth')
+    const result = await mammoth.extractRawText({ arrayBuffer: await file.arrayBuffer() })
+    text = result.value
+    if (text.trim() === '') throw new Error(`无法从 ${file.name} 提取可读文本`)
+  } else if (kind === 'spreadsheet') {
+    const XLSX = await import('xlsx')
+    const workbook = XLSX.read(await file.arrayBuffer(), { type: 'array' })
+    text = workbook.SheetNames.slice(0, 20).map(name => {
+      const sheet = workbook.Sheets[name]
+      return `工作表：${name}\n${XLSX.utils.sheet_to_csv(sheet, { blankrows: false }).trim()}`
+    }).filter(Boolean).join('\n\n')
+    if (text.trim() === '') throw new Error(`Excel 文件 ${file.name} 没有可读取的单元格内容`)
+  } else text = await file.text()
+  const compact = text.replaceAll('\u0000', '').trim()
+  const truncated = compact.length > MAX_ATTACHMENT_TEXT_LENGTH
+  const limited = compact.slice(0, MAX_ATTACHMENT_TEXT_LENGTH)
+  const meta: FileAttachment = { name: file.name, mime: file.type || attachmentMime(kind), size: file.size, kind, extractedChars: limited.length, truncated }
+  return { name: file.name, kind, text: limited, meta }
+}
+
+function attachmentKind(file: File): AttachmentKind | null {
+  const extension = file.name.split('.').at(-1)?.toLowerCase() ?? ''
+  if (extension === 'pdf') return 'pdf'
+  if (extension === 'docx') return 'word'
+  if (extension === 'xlsx' || extension === 'xls') return 'spreadsheet'
+  if (['txt', 'md', 'json', 'csv', 'ts', 'tsx', 'js', 'jsx', 'py', 'java', 'go', 'rs', 'css', 'html', 'xml', 'yaml', 'yml', 'toml', 'ini', 'log'].includes(extension)) return 'text'
+  return null
+}
+function attachmentMime(kind: AttachmentKind) { return ({ pdf: 'application/pdf', word: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', spreadsheet: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', text: 'text/plain' } as Record<AttachmentKind, string>)[kind] }
+function attachmentLabel(kind: AttachmentKind) { return ({ pdf: 'PDF', word: 'Word', spreadsheet: 'Excel', text: '文本' } as Record<AttachmentKind, string>)[kind] }
+function escapeAttachmentAttribute(value: string) { return value.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;').replaceAll('>', '&gt;') }
+function serializeContextItem(item: ContextItem) {
+  if (item.kind === 'file' && item.attachment) {
+    const attachment = item.attachment
+    const text = item.content.slice(0, MAX_ATTACHMENT_TEXT_LENGTH).replaceAll('</atlas_attachment>', '&lt;/atlas_attachment&gt;')
+    return `\n\n<atlas_attachment name="${escapeAttachmentAttribute(attachment.name)}" kind="${attachment.kind}" mime="${escapeAttachmentAttribute(attachment.mime)}" bytes="${attachment.size}" truncated="${attachment.truncated}">\n${text}\n</atlas_attachment>`
+  }
+  return `\n\n<atlas_context type="${item.kind}" label="${escapeAttachmentAttribute(item.label)}">\n${item.content}\n</atlas_context>`
+}
+function splitAttachmentMessage(text: string) {
+  const attachments: FileAttachment[] = []
+  const body = text.replace(/<atlas_attachment\s+([^>]*)>[\s\S]*?<\/atlas_attachment>/gi, (_all, rawAttributes: string) => {
+    const read = (name: string) => decodeAttachmentAttribute(new RegExp(`${name}="([^"]*)"`, 'i').exec(rawAttributes)?.[1] ?? '')
+    const kind = read('kind')
+    const knownKind: AttachmentKind = kind === 'pdf' || kind === 'word' || kind === 'spreadsheet' || kind === 'text' ? kind : 'text'
+    const name = read('name') || '未命名文件'
+    const size = Number(read('bytes'))
+    attachments.push({ name, kind: knownKind, mime: read('mime') || attachmentMime(knownKind), size: Number.isFinite(size) ? size : 0, extractedChars: 0, truncated: read('truncated') === 'true' })
+    return ''
+  }).trim()
+  return { body, attachments }
+}
+function decodeAttachmentAttribute(value: string) { return value.replaceAll('&quot;', '"').replaceAll('&lt;', '<').replaceAll('&gt;', '>').replaceAll('&amp;', '&') }
 const globalScripts = new Map<string, Promise<any>>()
 function loadGlobalScript(src: string, globalName: string, force = false) {
   const global = (window as unknown as Record<string, any>)[globalName]; if (!force && global) return Promise.resolve(global)

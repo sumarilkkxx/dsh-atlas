@@ -26,7 +26,7 @@ DSH Atlas 是面向 DeepSeek Harness Web 的对话管理插件。它以 DSH 原�
 
 ### 卡片与详情
 
-- 卡片展示 Markdown 摘要、工具调用数量、待办状态和实时回复。
+- 卡片展示 Markdown 摘要、附件数量、工具调用数量、待办状态和实时回复。
 - 详情支持标题、段落、列表、表格、引用、链接、行内代码和代码块等 Markdown 内容。
 - 支持展开普通工具过程，并内嵌展示 `dsh-artifact` 产物：
   - ECharts / ECharts-GL
@@ -43,11 +43,11 @@ DSH Atlas 是面向 DeepSeek Harness Web 的对话管理插件。它以 DSH 原�
 - 根据模型元数据选择推理等级。
 - 输入 `/` 打开命令菜单，支持 `/status`、`/compact` 和 `/model`。
 - 输入 `@` 打开引用与文件入口。
-- 选择本地文本或代码文件作为本次消息上下文。
+- 选择 PDF、`.docx`、`.xlsx/.xls`、CSV、文本或代码文件作为本次消息上下文；卡片详情会显示文件名、类型和大小。
 - `Enter` 发送，`Shift + Enter` 换行。
 - 回复流式状态会同步回画布与详情。
 
-> 文件附件当前面向文本和代码文件：单个文件最大 256 KB，单次合计最大 512 KB。文件内容只在用户发送时作为该轮消息上下文提交。
+> 附件在浏览器本地解析：支持 PDF（仅含文本层）、`.docx`、`.xlsx/.xls`、CSV 与常见文本/代码文件。单个文件最大 12 MB，单次合计最大 24 MB；每个文件最多提取 48,000 个字符，单次最多 96,000 个字符。提取后的正文会作为该轮消息上下文写入 DSH 历史，原始二进制文件不会上传或保存到 Atlas。扫描版 PDF 需先进行 OCR；旧版 `.doc` 暂不支持，请转换为 `.docx`。
 
 ### 外观与可用性
 
@@ -55,33 +55,21 @@ DSH Atlas 是面向 DeepSeek Harness Web 的对话管理插件。它以 DSH 原�
 - 卡片、详情、Markdown、菜单与 Artifact 会跟随当前 Atlas 主题。
 - 支持卡片搜索、分支折叠、响应式布局和键盘操作。
 
-## 实现逻辑
+## 工作方式
 
 ```mermaid
 flowchart LR
-    DSH[DeepSeek Harness<br/>Session Log] --> Bridge[client.js<br/>DSH 客户端桥接]
-    Bridge --> API[index.js<br/>Atlas API 与静态资源]
-    API --> Store[(atlas.db<br/>幂等事件投影)]
-    Store --> UI[React 卡片画布]
-    UI --> Bridge
-    Bridge --> Native[DSH Session API<br/>模型 / 命令 / Prompt / Fork]
-    Bridge --> LLM[当前 DSH 模型<br/>会话摘要]
-    UI --> Store
+    DSH[DSH 会话历史] --> Atlas[Atlas 会话画布]
+    Atlas --> Cards[对话卡片与分支]
+    Atlas --> Summary[会话摘要]
+    Atlas --> Native[继续使用 DSH 模型、命令与工具]
+    Cards --> DSH
 ```
 
-项目由四个主要部分组成：
-
-1. **DSH Bundle 接入**
-   `cordis.patch.yml` 将 `dsh-atlas` 注入 Web profile，并复用 DSH 已有的 Web Server。
-
-2. **Host 服务与投影**
-   `index.js` 挂载 Atlas 前端资源和本地 API；`src/server/store.js` 将 DSH 持久事件幂等投影到 SQLite。冷启动重放不会重复生成卡片，分支关系、工具过程和卡片位置均使用稳定 Session/Event 标识。
-
-3. **浏览器桥接**
-   `client.js` 在 DSH 页面注册“对话 / 卡片视图”切换，并连接 `ctx.sessions`、`ctx.workspaces`、会话级模型目录与 `ctx.llm`。模型选择、命令、Prompt、创建会话与 Fork 都调用 DSH 原生接口；摘要请求使用当前会话选择的模型，但不写入原会话。
-
-4. **React 画布**
-   `src/app.tsx` 负责会话树、卡片布局、曲线连接、拖拽、详情、Markdown、Artifact 和内嵌输入框；生产构建输出到 `dist/`，由 Host 插件同源加载。
+1. Atlas 读取当前工作区的 DSH 会话历史，并按一轮“提问 + 回答”生成卡片。
+2. 从某条消息创建的 DSH 分支会在画布上保留为真实分支，而不是一份独立复制的对话。
+3. 你在卡片详情中继续发送消息时，仍使用 DSH 当前会话的模型、工具和命令。
+4. Atlas 将布局、卡片状态和摘要等辅助信息保存在本地；DSH 仍是原始对话历史的来源。
 
 ## 安装
 
@@ -128,7 +116,7 @@ dsh web
 6. 在详情底部直接选择模型、推理等级、文件或命令并继续对话。
 7. 点击 **返回对话** 可以随时切回 DSH 原生线性视图。
 
-## 本地开发
+## 从源码运行
 
 ```powershell
 pnpm install
@@ -140,9 +128,8 @@ pnpm dev
 常用命令：
 
 ```powershell
-pnpm build     # TypeScript 检查、Vite 构建及桥接脚本语法检查
+pnpm build     # 构建可安装的前端资源
 pnpm preview   # 预览生产构建
-pnpm test      # 构建并运行桥接、API、投影和分支逻辑测试
 ```
 
 > 不要直接双击 `dist/index.html`。Atlas 依赖同源 API 与 DSH 宿主上下文，构建产物需要通过 HTTP/DSH Web Server 加载。
