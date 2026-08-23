@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Archive, AtSign, Bot, Check, ChevronDown, ChevronLeft, ChevronRight, CircleMinus, CirclePlus, Command, FileText, Flag, Focus, GitBranch, ListTodo, LoaderCircle, MessageSquareText, Minus, Moon, MoreHorizontal, Paperclip, Plus, Search, Send, Sun, Trash2, Wrench, X } from 'lucide-react'
+import { Archive, AtSign, Bot, Check, ChevronDown, ChevronLeft, ChevronRight, CircleMinus, CirclePlus, Command, FileText, Focus, GitBranch, ListTodo, LoaderCircle, MessageSquareText, Minus, Moon, MoreHorizontal, Paperclip, Plus, Search, Send, Shield, Sun, Trash2, Wrench, X } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { Badge } from './components/ui/badge'
@@ -14,7 +14,8 @@ type Message = { sourceSeq: number; kind: string; text: string; process: Process
 type Task = { id: string; sessionId: string; sourceSeq: number; content: string; status: string; updatedAt?: string }
 type MarkerKind = 'none' | 'conclusion' | 'verify' | 'ruleout' | 'decision' | 'pivot' | 'open'
 type Marker = { important: boolean; kind: MarkerKind; updatedAt?: string | null }
-type Card = { id: string; sessionId: string; cwd: string; title: string; summary: string; sourceSeq: number | null; branchSeq?: number | null; parentCardId?: string; parentSessionId: string | null; position: Point | null; size?: CardSize | null; tools: number; todos: number; messages: Message[]; tasks: Task[]; marker: Marker }
+type CardMetrics = { llmMs?: number; ttftAverageMs?: number; tokensPerSecond?: number; cacheHitPercent?: number; inputTokens?: number; outputTokens?: number }
+type Card = { id: string; sessionId: string; cwd: string; title: string; summary: string; sourceSeq: number | null; branchSeq?: number | null; parentCardId?: string; parentSessionId: string | null; position: Point | null; size?: CardSize | null; tools: number; todos: number; metrics?: CardMetrics | null; messages: Message[]; tasks: Task[]; marker: Marker }
 type Workspace = { id?: string; cwd: string; title: string; sessionCount: number }
 type DshWorkspace = { id: string; title: string; path: string | null; sessionIds: string[] }
 type Compose = { kind: 'new' } | { kind: 'continue' | 'branch'; card: Card }
@@ -26,28 +27,31 @@ type ModelChoice = { id: string; name: string; description?: string; reasoning?:
 type ModelGroup = { id: string; name: string; models: ModelChoice[] }
 type ModelSelection = { provider: string; model: string; reasoningEffort?: string }
 type ModelDirectory = { current: ModelSelection | null; routable: boolean | null; groups: ModelGroup[]; failures: { id: string; name: string; message: string }[] }
-type AttachmentKind = 'pdf' | 'word' | 'spreadsheet' | 'text'
+type PermissionOption = { value: string; name: string; description?: string }
+type PermissionDirectory = { currentValue: string; options: PermissionOption[] }
+type AttachmentKind = 'pdf' | 'word' | 'spreadsheet' | 'code' | 'text'
 type FileAttachment = { name: string; mime: string; size: number; kind: AttachmentKind; extractedChars: number; truncated: boolean }
 type CommandDescriptor = { name: string; description: string; input?: { hint: string } }
 type SkillDescriptor = { name: string; description?: string; userInvocable?: boolean }
-type ContextItem = { id: string; kind: 'file' | 'card' | 'tool' | 'skill'; label: string; detail: string; content: string; attachment?: FileAttachment }
+type ContextItem = { id: string; kind: 'file' | 'card'; label: string; detail: string; content: string; attachment?: FileAttachment }
 type DeleteMode = 'single' | 'subtree'
 type DeleteState = { card: Card; mode: DeleteMode; successorId?: string }
 type UndoNotice = { operationId: string; count: number; title: string }
 type ResizeEdge = { left: boolean; right: boolean; top: boolean; bottom: boolean }
 type ConversationSummary = { rootSessionId: string; revision: string; text: string; provider?: string | null; model?: string | null; generatedAt?: string }
-type Filter = 'all' | 'tools' | 'todos' | 'marked' | MarkerKind
+type Filter = 'all' | 'tools' | 'todos' | 'attachments' | 'marked' | MarkerKind
 
 const demoCards: Card[] = [
-  { id: 's:turn:1', sessionId: 's', cwd: 'passport-web', title: '梳理登录回调异常', summary: '用户反馈生产环境在登录后反复回到登录页，需要定位回调链路与环境配置差异。', sourceSeq: 1, branchSeq: 2, parentSessionId: null, position: { x: 70, y: 190 }, tools: 2, todos: 1, messages: [], tasks: [{ id: 'demo-task', sessionId: 's', sourceSeq: 1, content: '核对生产回调地址', status: 'pending' }], marker: { important: true, kind: 'verify' } },
-  { id: 's:turn:4', sessionId: 's', cwd: 'passport-web', title: '检查中间件与回调地址', summary: '确认生产环境缺少协议前缀导致 URL 比较失败。', sourceSeq: 4, branchSeq: 5, parentCardId: 's:turn:1', parentSessionId: null, position: { x: 440, y: 190 }, tools: 3, todos: 0, messages: [], tasks: [], marker: { important: false, kind: 'decision' } },
+  { id: 's:turn:1', sessionId: 's', cwd: 'passport-web', title: '梳理登录回调异常', summary: '用户反馈生产环境在登录后反复回到登录页，需要定位回调链路与环境配置差异。', sourceSeq: 1, branchSeq: 2, parentSessionId: null, position: { x: 70, y: 190 }, tools: 2, todos: 1, metrics: { llmMs: 9500, ttftAverageMs: 1200, tokensPerSecond: 96, cacheHitPercent: 73, inputTokens: 48100, outputTokens: 576 }, messages: [], tasks: [{ id: 'demo-task', sessionId: 's', sourceSeq: 1, content: '核对生产回调地址', status: 'pending' }], marker: { important: true, kind: 'verify' } },
+  { id: 's:turn:4', sessionId: 's', cwd: 'passport-web', title: '检查中间件与回调地址', summary: '确认生产环境缺少协议前缀导致 URL 比较失败。', sourceSeq: 4, branchSeq: 5, parentCardId: 's:turn:1', parentSessionId: null, position: { x: 440, y: 190 }, tools: 3, todos: 0, metrics: { llmMs: 15700, ttftAverageMs: 790, tokensPerSecond: 142.9, cacheHitPercent: 99, inputTokens: 49952, outputTokens: 1908 }, messages: [], tasks: [], marker: { important: false, kind: 'decision' } },
   { id: 'b:turn:6', sessionId: 'b', cwd: 'passport-web', title: '另一种思路：关闭 URL 校验', summary: '此做法会削弱生产环境安全边界，因此不建议采用。', sourceSeq: 6, branchSeq: 7, parentCardId: 's:turn:4', parentSessionId: 's', position: { x: 810, y: 440 }, tools: 1, todos: 0, messages: [], tasks: [], marker: { important: false, kind: 'ruleout' } },
 ]
 const isDevPreview = location.port === '5173'
 const readCollapsed = () => { try { const value = JSON.parse(localStorage.getItem('dsh-atlas:collapsed:v1') ?? '[]'); return new Set<string>(Array.isArray(value) ? value.filter(item => typeof item === 'string') : []) } catch { return new Set<string>() } }
 const readCamera = () => { try { const value = JSON.parse(localStorage.getItem('dsh-atlas:camera:v3') ?? '{}'); return { scale: finite(value.scale, 1), offset: { x: finite(value.x, 0), y: finite(value.y, 0) } } } catch { return { scale: 1, offset: { x: 0, y: 0 } } } }
 const readThemeOverride = (): ThemeOverride => { const value = localStorage.getItem('dsh-atlas:theme:v1'); return value === 'light' || value === 'dark' ? value : null }
-const FILTER_OPTIONS: { id: Filter; label: string }[] = [{ id: 'all', label: '全部' }, { id: 'tools', label: '工具' }, { id: 'todos', label: '待办' }, { id: 'marked', label: '重点' }, { id: 'conclusion', label: '结论' }, { id: 'verify', label: '待验证' }]
+const readSidebarCollapsed = () => { try { return localStorage.getItem('dsh-atlas:sidebar-collapsed:v1') === 'true' } catch { return false } }
+const FILTER_OPTIONS: { id: Filter; label: string }[] = [{ id: 'all', label: '全部' }, { id: 'tools', label: '工具' }, { id: 'todos', label: '待办' }, { id: 'attachments', label: '附件' }, { id: 'marked', label: '重点' }, { id: 'conclusion', label: '结论' }, { id: 'verify', label: '待验证' }]
 
 export function App() {
   const camera = useMemo(readCamera, [])
@@ -75,6 +79,8 @@ export function App() {
   const [error, setError] = useState('')
   const [hostDark, setHostDark] = useState(false)
   const [themeOverride, setThemeOverride] = useState<ThemeOverride>(readThemeOverride)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(readSidebarCollapsed)
+  const [openCardMenuId, setOpenCardMenuId] = useState<string | null>(null)
   const [nativeModel, setNativeModel] = useState('使用当前 DSH 模型')
   const [sidebarDeleteMode, setSidebarDeleteMode] = useState(false)
   const [selectedSessionIds, setSelectedSessionIds] = useState<Set<string>>(() => new Set())
@@ -178,6 +184,8 @@ export function App() {
       if (data.type === 'atlas:model-selected') settle(data.requestId, data.directory)
       if (data.type === 'atlas:command-directory') settle(data.requestId, Array.isArray(data.commands) ? data.commands : [])
       if (data.type === 'atlas:skill-directory') settle(data.requestId, Array.isArray(data.skills) ? data.skills : [])
+      if (data.type === 'atlas:permission-directory') settle(data.requestId, data.permissions)
+      if (data.type === 'atlas:permission-selected') settle(data.requestId, data.permissions)
       if (data.type === 'atlas:command-ran') settle(data.requestId, data.result)
       if (data.type === 'atlas:map-opened') { setDetail(null); setDraft(''); setSummaryRefreshVersion(value => value + 1); window.setTimeout(() => focusRef.current(), 0) }
     }
@@ -194,7 +202,7 @@ export function App() {
   useEffect(() => { const timer = window.setTimeout(() => { try { localStorage.setItem('dsh-atlas:camera:v3', JSON.stringify({ scale, x: offset.x, y: offset.y })) } catch { /* storage can be disabled */ } }, 200); return () => window.clearTimeout(timer) }, [offset, scale])
   useEffect(() => { setZoomText(String(Math.round(scale * 100))) }, [scale])
   useEffect(() => { try { if (themeOverride) localStorage.setItem('dsh-atlas:theme:v1', themeOverride); else localStorage.removeItem('dsh-atlas:theme:v1') } catch { /* storage can be disabled */ } }, [themeOverride])
-
+  useEffect(() => { try { localStorage.setItem('dsh-atlas:sidebar-collapsed:v1', String(sidebarCollapsed)) } catch { /* storage can be disabled */ } }, [sidebarCollapsed])
   const selectedDshWorkspace = dshWorkspaces.find(item => item.id === selectedDshWorkspaceId)
   const workspaceCards = useMemo(() => selectedDshWorkspace === undefined
     ? cards.filter(card => !cwd || card.cwd === cwd)
@@ -266,11 +274,37 @@ export function App() {
     setCanvasRootSession(value => value === resolvedCanvasRoot ? value : resolvedCanvasRoot)
     setExpandedSessions(value => value.has(resolvedCanvasRoot) ? value : new Set([...value, resolvedCanvasRoot]))
   }, [resolvedCanvasRoot])
+  const focusCardFromLeft = useCallback((card: Card, point: Point) => {
+    const canvas = stage.current
+    if (!canvas) return
+    const size = cardSize(card)
+    const leftGutter = Math.min(72, Math.max(28, Math.round(canvas.clientWidth * .06)))
+    const cardHalfWidth = size.width * scale / 2
+    const targetCenterX = Math.max(24, Math.min(leftGutter + cardHalfWidth, canvas.clientWidth - cardHalfWidth - 24))
+    setOffset({ x: Math.round(targetCenterX - (point.x + size.width / 2) * scale), y: Math.round(canvas.clientHeight / 2 - (point.y + size.height / 2) * scale) })
+  }, [scale])
   const focusActive = useCallback(() => {
     const card = canvasCards.find(item => item.sessionId === activeSession) ?? canvasCards[0]
     const point = card && positions.get(card.id)
-    if (point && card && stage.current) { const size = cardSize(card); setOffset({ x: Math.round(stage.current.clientWidth / 2 - (point.x + size.width / 2) * scale), y: Math.round(stage.current.clientHeight / 2 - (point.y + size.height / 2) * scale) }) }
-  }, [activeSession, canvasCards, positions, scale])
+    if (point && card) focusCardFromLeft(card, point)
+  }, [activeSession, canvasCards, focusCardFromLeft, positions])
+  const fitVisibleConversation = useCallback((cardsToFit: Card[], nextPositions: Map<string, Point>) => {
+    const canvas = stage.current
+    if (!canvas || cardsToFit.length === 0) return
+    let minX = Infinity; let minY = Infinity; let maxX = -Infinity; let maxY = -Infinity
+    for (const card of cardsToFit) {
+      const point = nextPositions.get(card.id)
+      if (!point) continue
+      const size = cardSize(card)
+      minX = Math.min(minX, point.x); minY = Math.min(minY, point.y)
+      maxX = Math.max(maxX, point.x + size.width); maxY = Math.max(maxY, point.y + size.height)
+    }
+    if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxX) || !Number.isFinite(maxY)) return
+    const padding = Math.min(72, Math.max(32, Math.round(Math.min(canvas.clientWidth, canvas.clientHeight) * .08)))
+    const fitScale = Math.max(.5, Math.min(1, (canvas.clientWidth - padding * 2) / Math.max(1, maxX - minX), (canvas.clientHeight - padding * 2) / Math.max(1, maxY - minY)))
+    setScale(Math.round(fitScale * 100) / 100)
+    setOffset({ x: Math.round(canvas.clientWidth / 2 - (minX + maxX) / 2 * fitScale), y: Math.round(canvas.clientHeight / 2 - (minY + maxY) / 2 * fitScale) })
+  }, [])
   focusRef.current = focusActive
 
   function beginDrag(event: React.PointerEvent<HTMLElement>, card: Card) {
@@ -367,9 +401,7 @@ export function App() {
   function arrange() {
     const next = layoutConversationGraph(canvasCards, true)
     setCards(all => all.map(card => next.has(card.id) ? { ...card, position: next.get(card.id)! } : card))
-    const target = canvasCards.find(card => card.sessionId === activeSession) ?? canvasCards[0]
-    const point = target && next.get(target.id)
-    if (point && target && stage.current) { const size = cardSize(target); setOffset({ x: Math.round(stage.current.clientWidth / 2 - (point.x + size.width / 2) * scale), y: Math.round(stage.current.clientHeight / 2 - (point.y + size.height / 2) * scale) }) }
+    fitVisibleConversation(graph.cards, next)
     for (const [id, point] of next) void savePosition(id, point)
   }
   function toggleTheme() { setThemeOverride(dark ? 'light' : 'dark') }
@@ -445,12 +477,14 @@ export function App() {
     finally { setBusy(false) }
   }
 
-  return <main className={`atlas-shell ${dark ? 'atlas-dark' : ''}`}>
+  return <main className={`atlas-shell ${dark ? 'atlas-dark' : ''}`} onPointerDownCapture={event => {
+    if (!(event.target as HTMLElement).closest('.atlas-card-menu-wrap')) setOpenCardMenuId(null)
+  }}>
     <header className="atlas-topbar"><div className="atlas-brand"><span className="atlas-mark">A</span><span>DSH Atlas</span></div><div className="atlas-search atlas-search-mobile"><Search className="size-4" /><input value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索标题、对话、工具与待办" aria-label="搜索会话历史" /></div><div className="atlas-topbar-actions"><button className="atlas-theme-switch" type="button" role="switch" aria-checked={dark} onClick={toggleTheme} aria-label="切换深色或浅色主题" title={dark ? '切换为浅色主题' : '切换为深色主题'}><Sun className="atlas-theme-sun size-3.5" /><Moon className="atlas-theme-moon size-3.5" /><span className="atlas-theme-knob" /></button></div></header>
-    <div className="atlas-layout"><aside className="atlas-sidebar"><button type="button" className="atlas-new-session" onClick={() => { setCompose({ kind: 'new' }); setDraft('') }}><Plus className="size-3.5" /><span>新会话</span></button><div className="atlas-search atlas-search-sidebar"><Search className="size-4" /><input value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索标题、对话、工具与待办" aria-label="搜索会话历史" /></div><div className="atlas-filter-row" role="group" aria-label="筛选画布卡片">{FILTER_OPTIONS.map(item => <button key={item.id} type="button" className={filter === item.id ? 'is-active' : ''} onClick={() => setFilter(item.id)}>{item.label}</button>)}</div><div className="atlas-section-title"><span>工作目录</span></div>{dshWorkspaces.length > 0 ? <select className="atlas-workspace-select" value={selectedDshWorkspaceId} onChange={event => { const workspace = dshWorkspaces.find(item => item.id === event.target.value); setSelectedDshWorkspaceId(event.target.value); setCwd(workspace?.path ?? ''); setDetail(null); setCanvasRootSession('') }}>{dshWorkspaces.map(item => <option key={item.id} value={item.id}>{item.title} · {item.sessionIds.length}</option>)}</select> : <select className="atlas-workspace-select" value={cwd} onChange={event => { setCwd(event.target.value); setDetail(null); setCanvasRootSession('') }}>{workspaces.map(item => <option key={item.cwd} value={item.cwd}>{item.title} · {item.sessionCount}</option>)}</select>}<div className="atlas-section-title atlas-session-heading"><span>{searchActive ? '搜索到的会话' : '会话'}</span><div className="atlas-session-heading-actions">{sidebarDeleteMode ? <><button type="button" className="atlas-select-all" onClick={toggleAllSidebarSelections}>{allSidebarSelected ? '取消全选' : '全选'}</button><span>{selectedSidebarNodes.length}/{sidebarSessionCount}</span><button type="button" className="atlas-session-delete-trigger" onClick={exitSidebarDeleteMode} aria-label="取消批量删除" title="取消"><X className="size-3.5" /></button><button type="button" className="atlas-session-delete-trigger is-danger" disabled={selectedSidebarNodes.length === 0} onClick={() => setSidebarDeleteConfirm(true)} aria-label="删除已选会话" title="删除已选"><Trash2 className="size-3.5" /></button></> : <><span>{sidebarSessionCount}</span><button type="button" className="atlas-session-delete-trigger" onClick={() => { setSidebarDeleteMode(true); setSelectedSessionIds(new Set()) }} aria-label="批量删除会话" title="批量删除会话"><Trash2 className="size-3.5" /></button></>}</div></div><nav className="atlas-nav" aria-label={searchActive ? '搜索到的会话历史' : '会话与分支'}>{sidebarTree.map(node => <SessionNav key={node.id} node={node} activeSession={activeSession} canvasRoot={resolvedCanvasRoot} expanded={expandedSessions} onToggle={id => setExpandedSessions(value => { const next = new Set(value); if (next.has(id)) next.delete(id); else next.add(id); return next })} onSelect={selectSession} selectionMode={sidebarDeleteMode} selectedSessionIds={selectedSessionIds} onSelectForDelete={toggleSidebarSelection} />)}{searchActive && sidebarTree.length === 0 && <p className="atlas-nav-empty">没有匹配的会话历史</p>}</nav>{canvasTasks.length > 0 && <section className="atlas-task-list" aria-label="当前画布待办"><div className="atlas-section-title"><span>待办</span><span>{canvasTasks.length}</span></div>{canvasTasks.slice(0, 8).map(({ task, card }) => <button type="button" key={task.id} onClick={() => void open(card)} title={`定位到「${card.title}」`}><ListTodo className="size-3.5" /><span>{task.content}</span><em>{task.status}</em></button>)}</section>}</aside>
+    <div className={`atlas-layout ${sidebarCollapsed ? 'is-sidebar-collapsed' : ''}`}><aside className="atlas-sidebar"><button type="button" className="atlas-sidebar-toggle" onClick={() => setSidebarCollapsed(value => !value)} aria-label={sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'} title={sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'}><ChevronLeft className="size-4" /></button><button type="button" className="atlas-new-session" onClick={() => { setCompose({ kind: 'new' }); setDraft('') }}><Plus className="size-3.5" /><span>新会话</span></button><div className="atlas-search atlas-search-sidebar"><Search className="size-4" /><input value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索标题、对话、工具与待办" aria-label="搜索会话历史" /></div><div className="atlas-filter-row" role="group" aria-label="筛选画布卡片">{FILTER_OPTIONS.map(item => <button key={item.id} type="button" className={filter === item.id ? 'is-active' : ''} onClick={() => setFilter(item.id)}>{item.label}</button>)}</div><div className="atlas-section-title"><span>工作目录</span></div>{dshWorkspaces.length > 0 ? <select className="atlas-workspace-select" value={selectedDshWorkspaceId} onChange={event => { const workspace = dshWorkspaces.find(item => item.id === event.target.value); setSelectedDshWorkspaceId(event.target.value); setCwd(workspace?.path ?? ''); setDetail(null); setCanvasRootSession('') }}>{dshWorkspaces.map(item => <option key={item.id} value={item.id}>{item.title} · {item.sessionIds.length}</option>)}</select> : <select className="atlas-workspace-select" value={cwd} onChange={event => { setCwd(event.target.value); setDetail(null); setCanvasRootSession('') }}>{workspaces.map(item => <option key={item.cwd} value={item.cwd}>{item.title} · {item.sessionCount}</option>)}</select>}<div className="atlas-section-title atlas-session-heading"><span>{searchActive ? '搜索到的会话' : '会话'}</span><div className="atlas-session-heading-actions">{sidebarDeleteMode ? <><button type="button" className="atlas-select-all" onClick={toggleAllSidebarSelections}>{allSidebarSelected ? '取消全选' : '全选'}</button><span>{selectedSidebarNodes.length}/{sidebarSessionCount}</span><button type="button" className="atlas-session-delete-trigger" onClick={exitSidebarDeleteMode} aria-label="取消批量删除" title="取消"><X className="size-3.5" /></button><button type="button" className="atlas-session-delete-trigger is-danger" disabled={selectedSidebarNodes.length === 0} onClick={() => setSidebarDeleteConfirm(true)} aria-label="删除已选会话" title="删除已选"><Trash2 className="size-3.5" /></button></> : <><span>{sidebarSessionCount}</span><button type="button" className="atlas-session-delete-trigger" onClick={() => { setSidebarDeleteMode(true); setSelectedSessionIds(new Set()) }} aria-label="批量删除会话" title="批量删除会话"><Trash2 className="size-3.5" /></button></>}</div></div><nav className="atlas-nav" aria-label={searchActive ? '搜索到的会话历史' : '会话与分支'}>{sidebarTree.map(node => <SessionNav key={node.id} node={node} activeSession={activeSession} canvasRoot={resolvedCanvasRoot} expanded={expandedSessions} onToggle={id => setExpandedSessions(value => { const next = new Set(value); if (next.has(id)) next.delete(id); else next.add(id); return next })} onSelect={selectSession} selectionMode={sidebarDeleteMode} selectedSessionIds={selectedSessionIds} onSelectForDelete={toggleSidebarSelection} />)}{searchActive && sidebarTree.length === 0 && <p className="atlas-nav-empty">没有匹配的会话历史</p>}</nav>{canvasTasks.length > 0 && <section className="atlas-task-list" aria-label="当前画布待办"><div className="atlas-section-title"><span>待办</span><span>{canvasTasks.length}</span></div>{canvasTasks.slice(0, 8).map(({ task, card }) => <button type="button" key={task.id} onClick={() => void open(card)} title={`定位到「${card.title}」`}><ListTodo className="size-3.5" /><span>{task.content}</span><em>{task.status}</em></button>)}</section>}</aside>
       <section className="atlas-stage-wrap"><div className="atlas-stage-header"><div className="atlas-conversation-brief" tabIndex={0}><span>AI 摘要</span><p title={historyBrief}>{historyBrief}</p><div className="atlas-brief-popover" role="tooltip">{historyBrief}</div><small>{summaryRefreshing ? '正在根据会话历史更新摘要 · ' : ''}{refreshing && <span className="atlas-refresh-status"><LoaderCircle className="size-3 animate-spin" />后台同步中</span>}{searchActive ? `${matchingCards.length} / ${graph.cards.length} 张命中` : `${graph.cards.length} 张可见卡片`} · {branchCount} 个分支 · 可续问、折叠与移动</small></div><div className="atlas-stage-actions"><Button className="atlas-arrange-button" variant="outline" size="sm" onClick={arrange}>整理节点</Button><Button className="atlas-mobile-new" size="sm" onClick={() => { setCompose({ kind: 'new' }); setDraft('') }}><Plus className="size-3.5" />新建</Button><Button variant="outline" size="sm" onClick={focusActive}><Focus className="size-3.5" />定位</Button><div className="atlas-zoom"><button onClick={() => zoomAt(scale - .1)} aria-label="缩小"><Minus className="size-3.5" /></button><input value={zoomText} inputMode="numeric" aria-label="画布缩放百分比" onChange={event => setZoomText(event.target.value.replace(/[^0-9.]/g, ''))} onBlur={() => commitZoom()} onKeyDown={event => { if (event.key === 'Enter') { event.currentTarget.blur(); commitZoom(event.currentTarget.value) } }} /><span>%</span><button onClick={() => zoomAt(scale + .1)} aria-label="放大"><Plus className="size-3.5" /></button></div></div></div>
         {error && <div className="atlas-error" role="alert"><span>{error}</span><button onClick={() => setError('')}>关闭</button></div>}
-        <div ref={stage} className="atlas-stage" onPointerDown={event => { if (!(event.target as HTMLElement).closest('[data-card]')) { pan.current = { x: event.clientX, y: event.clientY, offset }; event.currentTarget.setPointerCapture(event.pointerId) } }} onPointerMove={move} onPointerUp={stop} onPointerCancel={stop} onWheel={event => { if ((event.target as HTMLElement).closest('[data-card]')) return; event.preventDefault(); zoomAt(scale + (event.deltaY < 0 ? .08 : -.08), event.clientX, event.clientY) }}>
+        <div ref={stage} className="atlas-stage" onDragStart={event => event.preventDefault()} onPointerDown={event => { if (!(event.target as HTMLElement).closest('[data-card]')) { event.preventDefault(); window.getSelection()?.removeAllRanges(); pan.current = { x: event.clientX, y: event.clientY, offset }; event.currentTarget.setPointerCapture(event.pointerId) } }} onPointerMove={move} onPointerUp={stop} onPointerCancel={stop} onWheel={event => { if ((event.target as HTMLElement).closest('[data-card]')) return; event.preventDefault(); zoomAt(scale + (event.deltaY < 0 ? .08 : -.08), event.clientX, event.clientY) }}>
           <div className="atlas-grid" />{loading && workspaceCards.length === 0 && <div className="atlas-empty"><LoaderCircle className="size-5 animate-spin" />正在同步 DSH 对话…</div>}{!loading && workspaceCards.length === 0 && <div className="atlas-empty"><MessageSquareText className="size-6" /><strong>当前工作区还没有可整理的对话</strong><span>在 DSH 中开始一次对话，Atlas 会自动生成卡片。</span></div>}
           <div className="atlas-world" style={{ transform: `translate(${offset.x}px, ${offset.y}px) scale(${scale})` }}>
             <svg className="atlas-connections" width="3600" height="2400" aria-hidden="true">
@@ -458,14 +492,14 @@ export function App() {
               {reconnectPreview.map(({ fromId, child }) => { const parent = canvasCards.find(card => card.id === fromId); const from = positions.get(fromId); const to = positions.get(child.id); return from && to && parent ? <path key={`preview:${child.id}`} d={connectorPath(from, to, child.parentSessionId !== null, cardSize(parent), cardSize(child))} className="atlas-connection is-reconnect-preview" /> : null })}
               {composeAnchor && composePoint && positions.get(composeAnchor.id) && <path d={draftConnector(positions.get(composeAnchor.id)!, composePoint, cardSize(composeAnchor), DEFAULT_CARD_SIZE)} className="atlas-connection is-draft" />}
             </svg>
-            {graph.cards.map(card => <CardView key={card.id} card={card} point={positions.get(card.id)!} active={card.sessionId === activeSession} deleting={deletePreviewIds.has(card.id)} matched={searchActive && matchingIds.has(card.id)} live={live[card.sessionId]} childCount={graph.childCounts.get(card.id) ?? 0} collapsed={collapsed.has(card.id)} canContinue={continuableCardIds.has(card.id)} draft={draft} setDraft={setDraft} busy={busy} fallbackModel={nativeModel} rpc={rpc} contextCards={canvasCards} onOpen={() => void open(card)} onDrag={event => beginDrag(event, card)} onResize={(event, edge) => beginResize(event, card, edge)} onContinue={() => { setCompose({ kind: 'continue', card }); setDraft('') }} onBranch={() => { setCompose({ kind: 'branch', card }); setDraft('') }} onSend={text => continueConversation(card.sessionId, text)} onCommand={line => runCommand(card.sessionId, line)} onOpenDsh={() => post('atlas:open-session', { sessionId: card.sessionId })} onArchive={() => requestArchive(card)} onDelete={() => requestDelete(card)} onMarker={marker => void saveMarker(card, marker)} onFilter={setFilter} onToggle={() => toggleChildren(card.id)} />)}
+              {graph.cards.map(card => <CardView key={card.id} card={card} point={positions.get(card.id)!} active={card.sessionId === activeSession} deleting={deletePreviewIds.has(card.id)} matched={searchActive && matchingIds.has(card.id)} live={live[card.sessionId]} childCount={graph.childCounts.get(card.id) ?? 0} collapsed={collapsed.has(card.id)} canContinue={continuableCardIds.has(card.id)} menuOpen={openCardMenuId === card.id} onMenuOpenChange={open => setOpenCardMenuId(open ? card.id : null)} draft={draft} setDraft={setDraft} busy={busy} fallbackModel={nativeModel} rpc={rpc} contextCards={canvasCards} onOpen={() => void open(card)} onDrag={event => beginDrag(event, card)} onResize={(event, edge) => beginResize(event, card, edge)} onContinue={() => { setCompose({ kind: 'continue', card }); setDraft('') }} onBranch={() => { setCompose({ kind: 'branch', card }); setDraft('') }} onSend={text => continueConversation(card.sessionId, text)} onCommand={line => runCommand(card.sessionId, line)} onOpenDsh={() => post('atlas:open-session', { sessionId: card.sessionId })} onArchive={() => requestArchive(card)} onDelete={() => requestDelete(card)} onMarker={marker => void saveMarker(card, marker)} onToggle={() => toggleChildren(card.id)} />)}
             {compose && composePoint && <DraftCardView compose={compose} point={composePoint} draft={draft} setDraft={setDraft} busy={busy} fallbackModel={nativeModel} rpc={rpc} contextCards={canvasCards} onCancel={() => { if (!busy) { setCompose(null); setDraft('') } }} onSubmit={text => submitCompose(text)} onCommand={line => compose.kind === 'new' ? Promise.resolve(null) : runCommand(compose.card.sessionId, line)} />}
           </div>
         </div>
       </section>
     </div>
     <Dialog open={detail !== null} onOpenChange={value => { if (!value) { setDetail(null); setDraft('') } }}><DialogContent className="atlas-detail-dialog"><div className="atlas-detail-content">{detail && <><header className="atlas-detail-header"><div className="flex gap-2"><Badge>{detail.parentSessionId ? '分支' : '会话'}</Badge><Badge>{detail.tools} 次工具</Badge></div><DialogTitle className="atlas-detail-title">对话详情</DialogTitle><p className="atlas-detail-subtitle" title={detail.title}>{previewText(detail.title)}</p></header><div className="atlas-detail-messages">{detail.messages.length ? detail.messages.map(message => <MessageView key={`${message.sourceSeq}:${message.kind}`} message={message} dark={dark} />) : <MarkdownText text={live[detail.sessionId] || detail.summary} />}{live[detail.sessionId] && <div className="atlas-detail-message is-assistant is-live"><span>DSH · 回复中</span><MarkdownText text={live[detail.sessionId]} /></div>}</div><footer className="atlas-detail-actions"><Button variant="outline" onClick={() => { setDetail(null); setCompose({ kind: 'branch', card: detail }); setDraft('') }}><GitBranch className="size-3.5" />从此回答分支</Button><Button variant="outline" onClick={() => post('atlas:open-session', { sessionId: detail.sessionId })}>在 DSH 中打开</Button></footer></>}</div></DialogContent></Dialog>
-    <Dialog open={deletion !== null} onOpenChange={value => { if (!value && !deleting) setDeletion(null) }}><DialogContent className="atlas-delete-dialog"><div className="pr-7">{deletion && deletePlan && <><div className="atlas-delete-icon"><Trash2 className="size-5" /></div><DialogTitle className="mt-3 text-xl text-[var(--fg-2)]">删除卡片节点</DialogTitle><p className="atlas-delete-intro">选择如何处理“{deletion.card.title}”。操作只影响 Atlas 画布，DSH 原始对话会保留。</p><div className="atlas-delete-options" role="radiogroup" aria-label="删除范围"><button type="button" role="radio" aria-checked={deletion.mode === 'single'} className={deletion.mode === 'single' ? 'is-selected' : ''} onClick={() => setDeletion(value => value ? { ...value, mode: 'single' } : value)}><span className="atlas-delete-radio" /><span><strong>仅删除当前节点</strong><small>{deletePlan.directChildren.length > 0 ? `后续 ${deletePlan.directChildren.length} 个直接节点将自动接到上一个节点` : '删除这一张卡片，不影响其它节点'}</small></span></button>{deletePlan.descendants.length > 1 && <button type="button" role="radio" aria-checked={deletion.mode === 'subtree'} className={deletion.mode === 'subtree' ? 'is-selected is-danger' : ''} onClick={() => setDeletion(value => value ? { ...value, mode: 'subtree' } : value)}><span className="atlas-delete-radio" /><span><strong>删除此节点及所有后续</strong><small>共 {deletePlan.descendants.length} 张卡片{deletePlan.branchCount > 0 ? `、${deletePlan.branchCount} 个分支` : ''}，主线和分支后续都会删除</small></span></button>}</div>{deletion.mode === 'single' && !deletePlan.target.parentCardId && !deletePlan.mainSuccessor && deletePlan.directChildren.length > 1 && <label className="atlas-successor-field"><span>选择新的起始节点</span><select value={deletion.successorId ?? ''} onChange={event => setDeletion(value => value ? { ...value, successorId: event.target.value } : value)}>{deletePlan.directChildren.map(card => <option key={card.id} value={card.id}>{card.title}</option>)}</select><small>其它直接分支会自动连接到这个节点。</small></label>}<div className="atlas-delete-actions"><Button variant="outline" disabled={deleting} onClick={() => setDeletion(null)}>取消</Button><Button className="atlas-danger-button" disabled={deleting} onClick={() => void confirmDelete()}>{deleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}{deletion.mode === 'subtree' ? `删除 ${deletePlan.descendants.length} 张卡片` : '删除当前节点'}</Button></div></>}</div></DialogContent></Dialog>
+    <Dialog open={deletion !== null} onOpenChange={value => { if (!value && !deleting) setDeletion(null) }}><DialogContent className="atlas-delete-dialog"><div className="pr-7">{deletion && deletePlan && <><div className="atlas-delete-icon"><Trash2 className="size-5" /></div><DialogTitle className="mt-3 text-xl text-[var(--fg-2)]">删除卡片节点</DialogTitle><p className="atlas-delete-intro">操作只影响 Atlas 画布，DSH 原始对话会保留。</p><div className="atlas-delete-options" role="radiogroup" aria-label="删除范围"><button type="button" role="radio" aria-checked={deletion.mode === 'single'} className={deletion.mode === 'single' ? 'is-selected' : ''} onClick={() => setDeletion(value => value ? { ...value, mode: 'single' } : value)}><span className="atlas-delete-radio" /><span><strong>仅删除当前节点</strong><small>{deletePlan.directChildren.length > 0 ? `后续 ${deletePlan.directChildren.length} 个直接节点将自动接到上一个节点` : '删除这一张卡片，不影响其它节点'}</small></span></button>{deletePlan.descendants.length > 1 && <button type="button" role="radio" aria-checked={deletion.mode === 'subtree'} className={deletion.mode === 'subtree' ? 'is-selected is-danger' : ''} onClick={() => setDeletion(value => value ? { ...value, mode: 'subtree' } : value)}><span className="atlas-delete-radio" /><span><strong>删除此节点及所有后续</strong><small>共 {deletePlan.descendants.length} 张卡片{deletePlan.branchCount > 0 ? `、${deletePlan.branchCount} 个分支` : ''}，主线和分支后续都会删除</small></span></button>}</div>{deletion.mode === 'single' && !deletePlan.target.parentCardId && !deletePlan.mainSuccessor && deletePlan.directChildren.length > 1 && <label className="atlas-successor-field"><span>选择新的起始节点</span><select value={deletion.successorId ?? ''} onChange={event => setDeletion(value => value ? { ...value, successorId: event.target.value } : value)}>{deletePlan.directChildren.map(card => <option key={card.id} value={card.id}>{card.title}</option>)}</select><small>其它直接分支会自动连接到这个节点。</small></label>}<div className="atlas-delete-actions"><Button variant="outline" disabled={deleting} onClick={() => setDeletion(null)}>取消</Button><Button className="atlas-danger-button" disabled={deleting} onClick={() => void confirmDelete()}>{deleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}{deletion.mode === 'subtree' ? `删除 ${deletePlan.descendants.length} 张卡片` : '删除当前节点'}</Button></div></>}</div></DialogContent></Dialog>
     <Dialog open={sidebarDeleteConfirm} onOpenChange={value => { if (!value && !sidebarDeleting) setSidebarDeleteConfirm(false) }}><DialogContent className="atlas-delete-dialog"><div className="pr-7"><div className="atlas-delete-icon"><Trash2 className="size-5" /></div><DialogTitle className="mt-3 text-xl text-[var(--fg-2)]">移除 {selectedSidebarNodes.length} 条会话记录</DialogTitle><p className="atlas-delete-intro">将所选会话从 Atlas 侧栏与画布视图移除；DSH 中的原始对话和消息不会被删除。</p><div className="atlas-delete-actions"><Button variant="outline" disabled={sidebarDeleting} onClick={() => setSidebarDeleteConfirm(false)}>取消</Button><Button className="atlas-danger-button" disabled={sidebarDeleting} onClick={() => void confirmSidebarDelete()}>{sidebarDeleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}确认移除</Button></div></div></DialogContent></Dialog>
     <Dialog open={archiveCard !== null} onOpenChange={value => { if (!value && !archiving) setArchiveCard(null) }}><DialogContent className="atlas-delete-dialog"><div className="pr-7">{archiveCard && <><div className="atlas-delete-icon"><Archive className="size-5" /></div><DialogTitle className="mt-3 text-xl text-[var(--fg-2)]">归档当前会话</DialogTitle><p className="atlas-delete-intro">“{archiveCard.title}”及其后续分支将从 Atlas 画布隐藏，但不会删除 DSH 中的原始对话。</p><div className="atlas-delete-actions"><Button variant="outline" disabled={archiving} onClick={() => setArchiveCard(null)}>取消</Button><Button disabled={archiving} onClick={() => void confirmArchive()}>{archiving ? <LoaderCircle className="size-4 animate-spin" /> : <Archive className="size-4" />}归档会话</Button></div></>}</div></DialogContent></Dialog>
     {undoNotice && <div className="atlas-undo-toast" role="status"><span>已删除 {undoNotice.count} 张卡片</span><button type="button" onClick={() => void undoDelete()}>撤销</button><button type="button" aria-label="关闭撤销提示" onClick={() => setUndoNotice(null)}><X className="size-4" /></button></div>}
@@ -474,16 +508,23 @@ export function App() {
 
 function NativeComposer({ sessionId, draft, setDraft, busy, fallbackModel, rpc, contextCards, sourceCard, onSend, onCommand }: { sessionId: string; draft: string; setDraft: (value: string | ((previous: string) => string)) => void; busy: boolean; fallbackModel: string; rpc: (type: string, body?: object) => Promise<unknown>; contextCards: Card[]; sourceCard: Card; onSend: (text: string) => Promise<void>; onCommand: (line: string) => Promise<unknown> }) {
   const [directory, setDirectory] = useState<ModelDirectory | null>(null)
+  const [permissions, setPermissions] = useState<PermissionDirectory | null>(null)
   const [commands, setCommands] = useState<CommandDescriptor[]>([])
   const [skills, setSkills] = useState<SkillDescriptor[]>([])
-  const [menu, setMenu] = useState<'model' | 'effort' | 'command' | 'mention' | null>(null)
+  const [menu, setMenu] = useState<'model' | 'models' | 'effort' | 'permission' | 'command' | 'mention' | 'history' | 'skills' | null>(null)
   const [modelBusy, setModelBusy] = useState(false)
+  const [permissionBusy, setPermissionBusy] = useState(false)
   const [modelError, setModelError] = useState('')
+  const [permissionError, setPermissionError] = useState('')
+  const [contextError, setContextError] = useState('')
   const [commandError, setCommandError] = useState('')
   const [contextItems, setContextItems] = useState<ContextItem[]>([])
   const [notice, setNotice] = useState('')
+  const [permissionConfirm, setPermissionConfirm] = useState<PermissionOption | null>(null)
+  const [permissionAcknowledged, setPermissionAcknowledged] = useState(false)
   const fileInput = useRef<HTMLInputElement>(null)
   const composer = useRef<HTMLFormElement>(null)
+  const popup = useRef<HTMLDivElement>(null)
   const loadModels = useCallback(async () => {
     setModelBusy(true); setModelError('')
     try { setDirectory(await rpc('atlas:get-models', { sessionId }) as ModelDirectory) }
@@ -499,23 +540,42 @@ function NativeComposer({ sessionId, draft, setDraft, busy, fallbackModel, rpc, 
     try { setSkills(await rpc('atlas:get-skills', { sessionId }) as SkillDescriptor[]) }
     catch { setSkills([]) }
   }, [rpc, sessionId])
-  useEffect(() => { setMenu(null); setContextItems([]); void Promise.all([loadModels(), loadCommands(), loadSkills()]) }, [loadCommands, loadModels, loadSkills])
+  const loadPermissions = useCallback(async () => {
+    setPermissionBusy(true); setPermissionError('')
+    try { setPermissions(await rpc('atlas:get-permissions', { sessionId }) as PermissionDirectory) }
+    catch (reason) { setPermissionError(reason instanceof Error ? reason.message : '权限范围加载失败') }
+    finally { setPermissionBusy(false) }
+  }, [rpc, sessionId])
+  useEffect(() => { setMenu(null); setContextItems([]); void Promise.all([loadModels(), loadCommands(), loadSkills(), loadPermissions()]) }, [loadCommands, loadModels, loadPermissions, loadSkills])
   useEffect(() => {
     if (menu === null) return
-    const close = (event: MouseEvent) => { if (!composer.current?.contains(event.target as Node)) setMenu(null) }
-    document.addEventListener('mousedown', close)
-    return () => document.removeEventListener('mousedown', close)
+    const close = (event: PointerEvent) => {
+      const target = event.target as Element | null
+      if (target && (popup.current?.contains(target) || target.closest('[data-composer-trigger]'))) return
+      setMenu(null)
+    }
+    const escape = (event: KeyboardEvent) => { if (event.key === 'Escape') setMenu(null) }
+    document.addEventListener('pointerdown', close, true)
+    document.addEventListener('keydown', escape)
+    return () => { document.removeEventListener('pointerdown', close, true); document.removeEventListener('keydown', escape) }
   }, [menu])
   const choices = directory?.groups.flatMap(group => group.models.map(model => ({ group, model }))) ?? []
   const currentChoice = choices.find(choice => choice.group.id === directory?.current?.provider && choice.model.id === directory.current.model)
   const currentEffort = directory?.current?.reasoningEffort ?? currentChoice?.model.reasoning?.defaultEffort
   const effortLabel = currentChoice?.model.reasoning?.efforts.find(item => item.id === currentEffort)?.name ?? currentEffort
   const modelLabel = currentChoice?.model.name ?? fallbackModel.split('，')[0]?.replace(/ · .*/, '') ?? '选择模型'
+  const permissionLabel = permissionName(permissions?.currentValue)
   const selectModel = async (selection: ModelSelection) => {
     setModelBusy(true); setModelError('')
     try { setDirectory(await rpc('atlas:select-model', { sessionId, selection }) as ModelDirectory); setMenu(null) }
     catch (reason) { setModelError(reason instanceof Error ? reason.message : '模型切换失败') }
     finally { setModelBusy(false) }
+  }
+  const selectPermission = async (option: PermissionOption) => {
+    setPermissionBusy(true); setPermissionError('')
+    try { setPermissions(await rpc('atlas:select-permission', { sessionId, preset: option.value }) as PermissionDirectory); setMenu(null); return true }
+    catch (reason) { setPermissionError(reason instanceof Error ? reason.message : '权限范围切换失败'); return false }
+    finally { setPermissionBusy(false) }
   }
   const addFiles = async (list: FileList | null) => {
     if (!list) return
@@ -523,17 +583,17 @@ function NativeComposer({ sessionId, draft, setDraft, busy, fallbackModel, rpc, 
     let total = contextItems.filter(item => item.kind === 'file').reduce((sum, item) => sum + (item.attachment?.size ?? new Blob([item.content]).size), 0)
     let totalText = contextItems.filter(item => item.kind === 'file').reduce((sum, item) => sum + item.content.length, 0)
     for (const file of [...list]) {
-      if (file.size > MAX_ATTACHMENT_BYTES || total + file.size > MAX_ATTACHMENT_TOTAL_BYTES) { setModelError(`单个文件不能超过 ${formatBytes(MAX_ATTACHMENT_BYTES)}，本次合计不能超过 ${formatBytes(MAX_ATTACHMENT_TOTAL_BYTES)}`); continue }
+      if (file.size > MAX_ATTACHMENT_BYTES || total + file.size > MAX_ATTACHMENT_TOTAL_BYTES) { setContextError(`单个文件不能超过 ${formatBytes(MAX_ATTACHMENT_BYTES)}，本次合计不能超过 ${formatBytes(MAX_ATTACHMENT_TOTAL_BYTES)}`); continue }
       try {
         const attachment = await extractFileAttachment(file)
         const remaining = MAX_ATTACHMENT_TOTAL_TEXT_LENGTH - totalText
-        if (remaining < 800) { setModelError(`已达到本次附件可读内容上限（${Math.round(MAX_ATTACHMENT_TOTAL_TEXT_LENGTH / 1000)}k 字符）`); break }
+        if (remaining < 800) { setContextError(`已达到本次附件可读内容上限（${Math.round(MAX_ATTACHMENT_TOTAL_TEXT_LENGTH / 1000)}k 字符）`); break }
         const content = attachment.text.slice(0, remaining)
         const meta = { ...attachment.meta, extractedChars: content.length, truncated: attachment.meta.truncated || content.length < attachment.text.length }
         next.push({ id: crypto.randomUUID(), kind: 'file', label: attachment.name, detail: `${attachmentLabel(attachment.kind)} · ${formatBytes(attachment.meta.size)}${meta.truncated ? ' · 已截取正文' : ''}`, content, attachment: meta })
         total += file.size
         totalText += content.length
-      } catch (reason) { setModelError(reason instanceof Error ? reason.message : `无法读取文件：${file.name}`) }
+      } catch (reason) { setContextError(reason instanceof Error ? reason.message : `无法读取文件：${file.name}`) }
     }
     setContextItems(value => [...value, ...next])
     if (fileInput.current) fileInput.current.value = ''
@@ -556,32 +616,57 @@ function NativeComposer({ sessionId, draft, setDraft, busy, fallbackModel, rpc, 
   const commandQuery = draft.trimStart().replace(/^\//, '').toLocaleLowerCase()
   const visibleCommands = useMemo(() => commands.filter(command => `${command.name} ${command.description}`.toLocaleLowerCase().includes(commandQuery)), [commandQuery, commands])
   const mentionQuery = (draft.match(/(?:^|\s)@([^\s]*)$/)?.[1] ?? '').toLocaleLowerCase()
-  const toolContexts = useMemo(() => contextCards.flatMap(card => card.messages.flatMap(message => message.process.filter(item => item.result || item.error).map(item => ({ id: `tool:${card.id}:${item.callId}`, kind: 'tool' as const, label: `${item.name} · ${card.title}`, detail: item.error ? '工具错误' : '最近工具输出', content: [item.arguments, item.result, item.error].filter(Boolean).join('\n').slice(0, 8_000) })))).filter(item => item.content !== ''), [contextCards])
-  const cardContexts = useMemo(() => [sourceCard, ...contextCards.filter(card => card.id !== sourceCard.id)].slice(0, 8).map(card => ({ id: `card:${card.id}`, kind: 'card' as const, label: card.title, detail: card.sessionId === sourceCard.sessionId ? '当前会话卡片' : '画布会话卡片', content: `${card.title}\n${card.summary}`.slice(0, 8_000) })), [contextCards, sourceCard])
-  const skillContexts = useMemo(() => skills.filter(skill => skill.userInvocable !== false).map(skill => ({ id: `skill:${skill.name}`, kind: 'skill' as const, label: skill.name, detail: skill.description ?? 'DSH 技能', content: `/${skill.name} ` })), [skills])
-  const mentions = useMemo(() => [...cardContexts, ...toolContexts, ...skillContexts].filter(item => `${item.label} ${item.detail}`.toLocaleLowerCase().includes(mentionQuery)), [cardContexts, mentionQuery, skillContexts, toolContexts])
-  const pickContext = (item: ContextItem) => {
-    setContextItems(value => value.some(existing => existing.id === item.id) ? value : [...value, item])
-    setDraft(value => value.replace(/(?:^|\s)@[^\s]*$/, match => match.startsWith(' ') ? ' ' : ''))
+  const cardContexts = useMemo(() => {
+    const seen = new Set<string>()
+    return [sourceCard, ...contextCards].filter(card => !seen.has(card.id) && seen.add(card.id)).map(card => {
+      const transcript = card.messages.filter(message => message.kind === 'user' || message.kind === 'assistant').map(message => `${message.kind === 'user' ? '用户' : '助手'}：${message.text}`).join('\n\n')
+      const complete = `对话卡片：${card.title}\n\n${transcript || card.summary}`
+      const content = complete.slice(0, MAX_CONVERSATION_CONTEXT_LENGTH)
+      return { id: `card:${card.id}`, kind: 'card' as const, label: card.title, detail: `${card.sessionId === sourceCard.sessionId ? '当前会话' : '对话历史'} · ${card.messages.length} 条消息${content.length < complete.length ? ' · 已截取' : ''}`, content }
+    }).filter(item => `${item.label} ${item.detail}`.toLocaleLowerCase().includes(mentionQuery))
+  }, [contextCards, mentionQuery, sourceCard])
+  const visibleSkills = useMemo(() => skills.filter(skill => skill.userInvocable !== false && `${skill.name} ${skill.description ?? ''}`.toLocaleLowerCase().includes(mentionQuery)), [mentionQuery, skills])
+  const selectedCardIds = new Set(contextItems.filter(item => item.kind === 'card').map(item => item.id))
+  const allCardsSelected = cardContexts.length > 0 && cardContexts.every(item => selectedCardIds.has(item.id))
+  const stripMention = (value: string) => value.replace(/(?:^|\s)@[^\s]*$/, match => match.startsWith(' ') ? ' ' : '')
+  const toggleCard = (item: ContextItem) => setContextItems(value => value.some(existing => existing.id === item.id) ? value.filter(existing => existing.id !== item.id) : [...value, item])
+  const toggleAllCards = () => setContextItems(value => {
+    const files = value.filter(item => item.kind !== 'card')
+    return allCardsSelected ? files : [...files, ...cardContexts]
+  })
+  const finishContextSelection = () => { setDraft(stripMention); setMenu(null) }
+  const chooseSkill = (skill: SkillDescriptor) => {
+    setDraft(value => {
+      const replacement = `/${skill.name} `
+      return value.match(/(?:^|\s)@[^\s]*$/) ? value.replace(/(?:^|\s)@[^\s]*$/, match => `${match.startsWith(' ') ? ' ' : ''}${replacement}`) : `${value.trimEnd()} ${replacement}`.trimStart()
+    })
     setMenu(null)
   }
-  const commandVisible = menu === 'command' || draft.trimStart().startsWith('/')
-  const mentionVisible = menu === 'mention' || draft.match(/(?:^|\s)@[^\s]*$/) !== null
-  return <form ref={composer} className="atlas-native-composer mt-4" data-composer-card onSubmit={event => { event.preventDefault(); void submit() }}>
-    {(menu === 'model' || menu === 'effort') && <div className="atlas-native-menu atlas-model-menu" role="menu" aria-label="模型与推理等级">
-      <div className="atlas-menu-head">{menu === 'effort' && <button type="button" onClick={() => setMenu('model')} aria-label="返回模型列表"><ChevronLeft className="size-4" /></button>}<strong>{menu === 'model' ? '选择模型' : '推理等级'}</strong>{modelBusy && <LoaderCircle className="size-4 animate-spin" />}</div>
+  const commandVisible = menu === 'command' || (menu === null && draft.trimStart().startsWith('/'))
+  const mentionVisible = menu === 'mention' || (menu === null && draft.match(/(?:^|\s)@[^\s]*$/) !== null)
+  const modelMenuVisible = menu === 'model' || menu === 'models' || menu === 'effort'
+  return <>
+  <form ref={composer} className="atlas-native-composer mt-4" data-composer-card onSubmit={event => { event.preventDefault(); void submit() }}>
+    {modelMenuVisible && <div ref={popup} className="atlas-native-menu atlas-model-menu" role="menu" aria-label="模型与推理等级">
+      <div className="atlas-menu-head">{menu !== 'model' && <button type="button" onClick={() => setMenu('model')} aria-label="返回模型设置"><ChevronLeft className="size-4" /></button>}<strong>{menu === 'model' ? '模型设置' : menu === 'models' ? '选择模型' : '推理等级'}</strong>{modelBusy && <LoaderCircle className="size-4 animate-spin" />}</div>
       {modelError && <div className="atlas-menu-error"><span>{modelError}</span><button type="button" onClick={() => void loadModels()}>重试</button></div>}
-      {menu === 'model' && <div className="atlas-model-groups">{directory?.groups.map(group => <section key={group.id}><h4>{group.name}</h4>{group.models.map(model => { const selected = group.id === directory.current?.provider && model.id === directory.current.model; return <button type="button" role="menuitemradio" aria-checked={selected} disabled={modelBusy} key={model.id} onClick={() => { if (selected && model.reasoning?.efforts.length) setMenu('effort'); else void selectModel({ provider: group.id, model: model.id, ...(model.reasoning?.defaultEffort ? { reasoningEffort: model.reasoning.defaultEffort } : {}) }) }}><span><strong>{model.name}</strong>{model.description && <small>{model.description}</small>}</span>{selected ? <Check className="size-4" /> : <ChevronRight className="size-3.5 opacity-40" />}</button>})}</section>)}</div>}
+      {menu === 'model' && <div className="atlas-menu-overview"><button type="button" className="atlas-menu-cell" onClick={() => setMenu('models')}><span>模型</span><em>{modelLabel}</em><ChevronRight className="size-3.5" /></button><button type="button" className="atlas-menu-cell" disabled={!currentChoice?.model.reasoning?.efforts.length} onClick={() => setMenu('effort')}><span>推理等级</span><em>{effortLabel ?? '默认'}</em><ChevronRight className="size-3.5" /></button></div>}
+      {menu === 'models' && <div className="atlas-model-groups">{directory?.groups.map(group => <section key={group.id}><h4>{group.name}</h4>{group.models.map(model => { const selected = group.id === directory.current?.provider && model.id === directory.current.model; return <button type="button" role="menuitemradio" aria-checked={selected} disabled={modelBusy} key={`${group.id}:${model.id}`} onClick={() => { if (selected) { setMenu(null); return } void selectModel({ provider: group.id, model: model.id, ...(model.reasoning?.defaultEffort ? { reasoningEffort: model.reasoning.defaultEffort } : {}) }) }}><span><strong>{model.name}</strong>{model.description && <small>{model.description}</small>}</span>{selected && <Check className="size-4" />}</button>})}</section>)}</div>}
       {menu === 'effort' && <div className="atlas-model-groups">{currentChoice?.model.reasoning?.efforts.map(effort => { const selected = effort.id === currentEffort; return <button type="button" role="menuitemradio" aria-checked={selected} disabled={modelBusy} key={effort.id} onClick={() => void selectModel({ provider: currentChoice.group.id, model: currentChoice.model.id, reasoningEffort: effort.id })}><span><strong>{effort.name}</strong>{effort.description && <small>{effort.description}</small>}</span>{selected && <Check className="size-4" />}</button>})}</div>}
     </div>}
-    {commandVisible && <div className="atlas-native-menu atlas-command-help" role="menu" aria-label="DSH 命令目录">{commandError && <div className="atlas-menu-error"><span>{commandError}</span><button type="button" onClick={() => void loadCommands()}>重试</button></div>}{visibleCommands.map(command => <button type="button" role="menuitem" key={command.name} onClick={() => { if (command.name === 'model') { setDraft('/model'); setMenu('model') } else { setDraft(`/${command.name}${command.input ? ' ' : ''}`); setMenu(null) } }}><span><code>/{command.name}</code>{command.description}</span><small>{command.input?.hint ?? '执行命令'}</small></button>)}{!commandError && visibleCommands.length === 0 && <p className="atlas-menu-empty">当前 DSH Profile 没有匹配的命令</p>}</div>}
-    {mentionVisible && <div className="atlas-native-menu atlas-mention-menu" role="menu" aria-label="添加上下文"><button type="button" role="menuitem" onClick={() => fileInput.current?.click()}><Paperclip className="size-4" /><span><strong>选择本地文件</strong><small>支持 PDF、Word、Excel 与文本，会提取正文作为本次上下文</small></span></button>{mentions.map(item => <button type="button" role="menuitem" key={item.id} onClick={() => pickContext(item)}>{item.kind === 'tool' ? <Wrench className="size-4" /> : item.kind === 'skill' ? <Command className="size-4" /> : <FileText className="size-4" />}<span><strong>{item.label}</strong><small>{item.detail}</small></span></button>)}{mentions.length === 0 && <p className="atlas-menu-empty">没有匹配的卡片、工具输出或技能</p>}</div>}
+    {menu === 'permission' && <div ref={popup} className="atlas-native-menu atlas-permission-menu" role="menu" aria-label="权限范围">{permissionError && <div className="atlas-menu-error"><span>{permissionError}</span><button type="button" onClick={() => void loadPermissions()}>重试</button></div>}{permissions?.options.map(option => { const selected = option.value === permissions.currentValue; return <button type="button" role="menuitemradio" aria-checked={selected} disabled={permissionBusy} key={option.value} onClick={() => { if (selected) { setMenu(null); return } if (option.value === 'danger-full-access') { setPermissionConfirm(option); setPermissionAcknowledged(false); setMenu(null) } else void selectPermission(option) }}><Shield className="size-4" /><span><strong>{permissionName(option.value, option.name)}</strong>{option.description && <small>{option.description}</small>}</span>{selected && <Check className="size-4" />}</button>})}{permissionBusy && <div className="atlas-menu-loading"><LoaderCircle className="size-4 animate-spin" />正在同步 DSH 权限</div>}</div>}
+    {commandVisible && <div ref={popup} className="atlas-native-menu atlas-command-help" role="menu" aria-label="DSH 命令目录">{commandError && <div className="atlas-menu-error"><span>{commandError}</span><button type="button" onClick={() => void loadCommands()}>重试</button></div>}{visibleCommands.map(command => <button type="button" role="menuitem" key={command.name} onClick={() => { if (command.name === 'model') { setDraft('/model'); setMenu('model') } else { setDraft(`/${command.name}${command.input ? ' ' : ''}`); setMenu(null) } }}><span><code>/{command.name}</code>{command.description}</span><small>{command.input?.hint ?? '执行命令'}</small></button>)}{!commandError && visibleCommands.length === 0 && <p className="atlas-menu-empty">当前 DSH Profile 没有匹配的命令</p>}</div>}
+    {mentionVisible && <div ref={popup} className="atlas-native-menu atlas-mention-menu" role="menu" aria-label="添加上下文">{contextError && <div className="atlas-menu-error"><span>{contextError}</span><button type="button" onClick={() => setContextError('')}>关闭</button></div>}<button type="button" role="menuitem" onClick={() => { setDraft(stripMention); setMenu(null); fileInput.current?.click() }}><Paperclip className="size-4" /><span><strong>选择本地文件</strong><small>PDF、Word、Excel、代码与配置文件</small></span><ChevronRight className="size-3.5" /></button><button type="button" role="menuitem" onClick={() => setMenu('history')}><MessageSquareText className="size-4" /><span><strong>对话历史</strong><small>全部或多选单独的对话卡片</small></span><ChevronRight className="size-3.5" /></button><button type="button" role="menuitem" onClick={() => setMenu('skills')}><Command className="size-4" /><span><strong>Skills</strong><small>{visibleSkills.length} 个可调用技能</small></span><ChevronRight className="size-3.5" /></button></div>}
+    {menu === 'history' && <div ref={popup} className="atlas-native-menu atlas-context-picker" role="menu" aria-label="选择对话历史"><div className="atlas-menu-head"><button type="button" onClick={() => setMenu('mention')} aria-label="返回上下文分类"><ChevronLeft className="size-4" /></button><strong>对话历史</strong><button type="button" className="atlas-menu-done" onClick={finishContextSelection}>完成</button></div><div className="atlas-context-list"><button type="button" role="menuitemcheckbox" aria-checked={allCardsSelected} onClick={toggleAllCards}><span className="atlas-context-check">{allCardsSelected && <Check className="size-3" />}</span><span><strong>全部对话</strong><small>选择画布中的 {cardContexts.length} 张对话卡片</small></span></button>{cardContexts.map(item => <button type="button" role="menuitemcheckbox" aria-checked={selectedCardIds.has(item.id)} key={item.id} onClick={() => toggleCard(item)}><span className="atlas-context-check">{selectedCardIds.has(item.id) && <Check className="size-3" />}</span><span><strong>{item.label}</strong><small>{item.detail}</small></span></button>)}</div></div>}
+    {menu === 'skills' && <div ref={popup} className="atlas-native-menu atlas-context-picker" role="menu" aria-label="选择 Skills"><div className="atlas-menu-head"><button type="button" onClick={() => setMenu('mention')} aria-label="返回上下文分类"><ChevronLeft className="size-4" /></button><strong>Skills</strong></div><div className="atlas-context-list">{visibleSkills.map(skill => <button type="button" role="menuitem" key={skill.name} onClick={() => chooseSkill(skill)}><Command className="size-4" /><span><strong>/{skill.name}</strong><small>{skill.description ?? 'DSH Skill'}</small></span><ChevronRight className="size-3.5" /></button>)}{visibleSkills.length === 0 && <p className="atlas-menu-empty">当前会话没有可调用的 Skill</p>}</div></div>}
     {notice && <div className="atlas-composer-notice"><span>{notice}</span><button type="button" aria-label="关闭状态" onClick={() => setNotice('')}><X className="size-3" /></button></div>}
-    {contextItems.length > 0 && <div className="atlas-attachment-rail" aria-label="已添加的上下文">{contextItems.map(item => <span key={item.id} title={item.detail}>{item.kind === 'tool' ? <Wrench className="size-3.5" /> : item.kind === 'skill' ? <Command className="size-3.5" /> : <FileText className="size-3.5" />}<b>{item.label}</b>{item.attachment && <small>{attachmentLabel(item.attachment.kind)}</small>}<button type="button" aria-label={`移除 ${item.label}`} onClick={() => setContextItems(value => value.filter(existing => existing.id !== item.id))}><X className="size-3" /></button></span>)}</div>}
-    <textarea className="atlas-native-input" value={draft} onChange={event => { const value = event.target.value; setDraft(value); if (value.match(/(?:^|\s)@[^\s]*$/)) setMenu('mention'); else if (value.trimStart().startsWith('/')) setMenu('command') }} onKeyDown={event => { if (event.key === 'Escape') { setMenu(null); return } if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void submit() } }} placeholder="给智能体发消息；输入 / 命令或 @ 添加上下文" maxLength={16000} disabled={busy} />
-    <div className="atlas-native-footer"><div className="atlas-native-left"><button type="button" className="atlas-plus-button" onClick={() => setMenu(menu === 'command' ? null : 'command')} aria-label="打开 DSH 命令"><Plus className="size-4" /></button><button type="button" onClick={() => fileInput.current?.click()} title="选择本地文件"><Paperclip className="size-4" /><span>文件</span></button><button type="button" onClick={() => setMenu(menu === 'mention' ? null : 'mention')} title="添加上下文" aria-label="添加上下文"><AtSign className="size-4" /></button></div><div className="atlas-native-right"><div className="atlas-model-trigger-wrap"><button type="button" className="atlas-model-trigger" onClick={() => setMenu(menu === 'model' ? null : 'model')} aria-haspopup="menu" aria-expanded={menu === 'model' || menu === 'effort'}><Bot className="size-4" /><span>{modelLabel}</span>{effortLabel && <em>{effortLabel}</em>}<ChevronDown className="size-3.5" /></button></div><button className="atlas-send-button" type="submit" disabled={busy || (!draft.trim() && contextItems.length === 0)} aria-label="发送消息">{busy ? <LoaderCircle className="size-4 animate-spin" /> : <Send className="size-4" />}</button></div></div>
-    <input ref={fileInput} className="sr-only" type="file" multiple accept=".pdf,.docx,.xlsx,.xls,.csv,.txt,.md,.json,.ts,.tsx,.js,.jsx,.py,.java,.go,.rs,.css,.html,.xml,.yaml,.yml,.toml,.ini,.log" onChange={event => void addFiles(event.target.files)} />
+    {contextItems.length > 0 && <div className="atlas-attachment-rail" aria-label="已添加的上下文">{contextItems.map(item => <span key={item.id} title={item.detail}>{item.kind === 'card' ? <MessageSquareText className="size-3.5" /> : <FileText className="size-3.5" />}<b>{item.label}</b>{item.attachment && <small>{attachmentLabel(item.attachment.kind)}</small>}<button type="button" aria-label={`移除 ${item.label}`} onClick={() => setContextItems(value => value.filter(existing => existing.id !== item.id))}><X className="size-3" /></button></span>)}</div>}
+    <textarea className="atlas-native-input" value={draft} onChange={event => { const value = event.target.value; setDraft(value); if (value.match(/(?:^|\s)@[^\s]*$/)) setMenu('mention'); else if (value.trimStart().startsWith('/')) setMenu('command'); else setMenu(null) }} onKeyDown={event => { if (event.key === 'Escape') { setMenu(null); return } if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void submit() } }} placeholder="一起探索未至之境，输入/命令或@上下文" maxLength={16000} disabled={busy} />
+    <div className="atlas-native-footer"><div className="atlas-native-left"><button type="button" data-composer-trigger className="atlas-plus-button" onClick={() => setMenu(menu === 'command' ? null : 'command')} aria-label="打开 DSH 命令"><Plus className="size-4" /></button><button type="button" data-composer-trigger className="atlas-permission-trigger" onClick={() => setMenu(menu === 'permission' ? null : 'permission')} aria-label={`权限范围：${permissionLabel}`} aria-haspopup="menu" aria-expanded={menu === 'permission'}><Shield className="size-4" /><span>{permissionLabel}</span><ChevronDown className="size-3.5" /></button><button type="button" data-composer-trigger className="atlas-utility-button" onClick={() => { setMenu(null); fileInput.current?.click() }} title="选择本地文件" aria-label="选择本地文件"><Paperclip className="size-4" /></button><button type="button" data-composer-trigger className="atlas-utility-button" onClick={() => setMenu(menu === 'mention' ? null : 'mention')} title="添加上下文" aria-label="添加上下文"><AtSign className="size-4" /></button></div><div className="atlas-native-right"><div className="atlas-model-trigger-wrap"><button type="button" data-composer-trigger className="atlas-model-trigger" onClick={() => setMenu(modelMenuVisible ? null : 'model')} aria-label={`模型：${modelLabel}${effortLabel ? `，推理等级 ${effortLabel}` : ''}`} aria-haspopup="menu" aria-expanded={modelMenuVisible}><Bot className="size-4" /><span>{modelLabel}</span>{effortLabel && <em>{effortLabel}</em>}<ChevronDown className="size-3.5" /></button></div><button className="atlas-send-button" type="submit" disabled={busy || (!draft.trim() && contextItems.length === 0)} aria-label="发送消息">{busy ? <LoaderCircle className="size-4 animate-spin" /> : <Send className="size-4" />}</button></div></div>
+    <input ref={fileInput} className="sr-only" type="file" multiple accept=".pdf,.docx,.xlsx,.xls,.csv,.txt,.md,.rtf,.json,.jsonc,.ts,.tsx,.js,.jsx,.mjs,.cjs,.py,.java,.go,.rs,.rb,.php,.c,.h,.cpp,.cc,.cxx,.hpp,.cs,.swift,.kt,.kts,.scala,.sh,.bash,.zsh,.ps1,.sql,.css,.scss,.less,.html,.htm,.xml,.svg,.vue,.svelte,.astro,.yaml,.yml,.toml,.ini,.cfg,.conf,.properties,.env,.graphql,.gql,.log,.lock,Dockerfile,Makefile" onChange={event => void addFiles(event.target.files)} />
   </form>
+  <Dialog open={permissionConfirm !== null} onOpenChange={value => { if (!value && !permissionBusy) setPermissionConfirm(null) }}><DialogContent className="atlas-permission-dialog"><div className="pr-7"><div className="atlas-permission-icon"><Shield className="size-5" /></div><DialogTitle className="mt-3 text-xl text-[var(--fg-2)]">启用全部权限</DialogTitle><p className="atlas-delete-intro">DSH 将允许此会话访问工作区之外的文件，并按当前审批策略执行命令。该设置会真实应用到当前会话。</p><label className="atlas-permission-confirm"><input type="checkbox" checked={permissionAcknowledged} onChange={event => setPermissionAcknowledged(event.target.checked)} /><span>我了解此权限范围，并确认继续</span></label>{permissionError && <p className="atlas-permission-dialog-error">{permissionError}</p>}<div className="atlas-delete-actions"><Button variant="outline" disabled={permissionBusy} onClick={() => setPermissionConfirm(null)}>取消</Button><Button disabled={permissionBusy || !permissionAcknowledged} onClick={() => { if (permissionConfirm) void selectPermission(permissionConfirm).then(changed => { if (changed) setPermissionConfirm(null) }) }}>{permissionBusy ? <LoaderCircle className="size-4 animate-spin" /> : <Shield className="size-4" />}确认全部权限</Button></div></div></DialogContent></Dialog>
+  </>
 }
 
 function DraftCardView({ compose, point, draft, setDraft, busy, fallbackModel, rpc, contextCards, onCancel, onSubmit, onCommand }: { compose: Compose; point: Point; draft: string; setDraft: (value: string | ((previous: string) => string)) => void; busy: boolean; fallbackModel: string; rpc: (type: string, body?: object) => Promise<unknown>; contextCards: Card[]; onCancel: () => void; onSubmit: (text: string) => Promise<void>; onCommand: (line: string) => Promise<unknown> }) {
@@ -593,12 +678,11 @@ function DraftCardView({ compose, point, draft, setDraft, busy, fallbackModel, r
   </article>
 }
 
-function CardView({ card, point, active, deleting, matched, live, childCount, collapsed, canContinue, draft, setDraft, busy, fallbackModel, rpc, contextCards, onOpen, onDrag, onResize, onContinue, onBranch, onSend, onCommand, onOpenDsh, onArchive, onDelete, onMarker, onFilter, onToggle }: { card: Card; point: Point; active: boolean; deleting: boolean; matched: boolean; live?: string; childCount: number; collapsed: boolean; canContinue: boolean; draft: string; setDraft: (value: string | ((previous: string) => string)) => void; busy: boolean; fallbackModel: string; rpc: (type: string, body?: object) => Promise<unknown>; contextCards: Card[]; onOpen: () => void; onDrag: (event: React.PointerEvent<HTMLElement>) => void; onResize: (event: React.PointerEvent<HTMLElement>, edge: ResizeEdge) => void; onContinue: () => void; onBranch: () => void; onSend: (text: string) => Promise<void>; onCommand: (line: string) => Promise<unknown>; onOpenDsh: () => void; onArchive: () => void; onDelete: () => void; onMarker: (marker: Marker) => void; onFilter: (filter: Filter) => void; onToggle: () => void }) {
-  const [menuOpen, setMenuOpen] = useState(false)
-  const choose = (marker: Marker) => { setMenuOpen(false); onMarker(marker) }
+function CardView({ card, point, active, deleting, matched, live, childCount, collapsed, canContinue, menuOpen, onMenuOpenChange, draft, setDraft, busy, fallbackModel, rpc, contextCards, onOpen, onDrag, onResize, onContinue, onBranch, onSend, onCommand, onOpenDsh, onArchive, onDelete, onMarker, onToggle }: { card: Card; point: Point; active: boolean; deleting: boolean; matched: boolean; live?: string; childCount: number; collapsed: boolean; canContinue: boolean; menuOpen: boolean; onMenuOpenChange: (open: boolean) => void; draft: string; setDraft: (value: string | ((previous: string) => string)) => void; busy: boolean; fallbackModel: string; rpc: (type: string, body?: object) => Promise<unknown>; contextCards: Card[]; onOpen: () => void; onDrag: (event: React.PointerEvent<HTMLElement>) => void; onResize: (event: React.PointerEvent<HTMLElement>, edge: ResizeEdge) => void; onContinue: () => void; onBranch: () => void; onSend: (text: string) => Promise<void>; onCommand: (line: string) => Promise<unknown>; onOpenDsh: () => void; onArchive: () => void; onDelete: () => void; onMarker: (marker: Marker) => void; onToggle: () => void }) {
+  const choose = (marker: Marker) => onMarker(marker)
   const canBranch = Number.isInteger(card.branchSeq)
   const isFreshConversation = card.sourceSeq === null && card.messages.length === 0
-  const fileCount = card.messages.reduce((total, message) => total + splitAttachmentMessage(message.text).attachments.length, 0)
+  const fileCount = cardAttachmentCount(card)
   const size = cardSize(card) as CardSize
   const title = previewText(card.title)
   const summary = previewText(live?.trim() || card.summary)
@@ -613,8 +697,20 @@ function CardView({ card, point, active, deleting, matched, live, childCount, co
     {canContinue && <button className="atlas-card-connector atlas-card-continue" onClick={event => { event.stopPropagation(); onContinue() }} aria-label="添加追问" title="添加追问"><Plus className="size-3.5" /></button>}
     {!canContinue && childCount > 0 && <button className="atlas-card-connector atlas-card-fold" onClick={event => { event.stopPropagation(); onToggle() }} aria-label={collapsed ? `展开 ${childCount} 个后续节点` : `折叠 ${childCount} 个后续节点`} title={collapsed ? '展开后续对话' : '折叠后续对话'}>{collapsed ? <CirclePlus className="size-3.5" /> : <CircleMinus className="size-3.5" />}</button>}
     {canBranch && <button className="atlas-card-connector atlas-card-branch" onClick={event => { event.stopPropagation(); onBranch() }} aria-label="从此回答创建分支" title="从此回答创建分支"><GitBranch className="size-3.5" /></button>}
-    <header><div className="flex items-center gap-2"><span className="atlas-card-dot" /><Badge>{isFreshConversation ? '新对话' : card.parentSessionId ? '另一种思路' : '对话'}</Badge>{card.marker.important && <span className="atlas-marker-chip"><Flag className="size-3" />重点</span>}{card.marker.kind !== 'none' && <span className={`atlas-marker-chip is-${card.marker.kind}`}>{markerLabel(card.marker.kind)}</span>}</div><div className="atlas-card-menu-wrap"><button className="atlas-card-menu-trigger" onClick={event => { event.stopPropagation(); setMenuOpen(value => !value) }} aria-label={`打开 ${card.title} 的卡片菜单`} aria-expanded={menuOpen} title="卡片状态与筛选"><MoreHorizontal className="size-4" /></button>{menuOpen && <div className="atlas-card-menu atlas-card-status-menu" role="menu"><div className="atlas-card-menu-label">快速筛选</div>{FILTER_OPTIONS.map(option => <button key={option.id} role="menuitem" className="atlas-card-menu-filter" onClick={event => { event.stopPropagation(); setMenuOpen(false); onFilter(option.id) }}><span>{option.label}</span><small>{option.id === 'tools' ? `${card.tools} 次工具` : option.id === 'todos' ? `${card.todos} 项待办` : '筛选画布'}</small></button>)}<div className="atlas-card-menu-label">卡片状态</div><button role="menuitemcheckbox" aria-checked={card.marker.important} onClick={event => { event.stopPropagation(); choose({ ...card.marker, important: !card.marker.important }) }}><Flag className="size-3.5" />{card.marker.important ? '取消重点' : '标为重点'}</button>{(['conclusion', 'verify'] as MarkerKind[]).map(kind => <button key={kind} role="menuitemradio" aria-checked={card.marker.kind === kind} onClick={event => { event.stopPropagation(); choose({ ...card.marker, kind }) }}><Check className={`size-3.5 ${card.marker.kind === kind ? '' : 'invisible'}`} />{markerLabel(kind)}</button>)}{(card.marker.important || card.marker.kind !== 'none') && <button role="menuitem" onClick={event => { event.stopPropagation(); choose({ important: false, kind: 'none' }) }}><X className="size-3.5" />清除状态</button>}<button role="menuitem" className="is-danger" onClick={event => { event.stopPropagation(); setMenuOpen(false); onDelete() }}><Trash2 className="size-3.5" />删除卡片</button></div>}</div></header>{isFreshConversation ? <div className="atlas-fresh-conversation" data-no-drag><h3>开始新对话</h3><p>输入第一条消息以开始当前会话。</p><NativeComposer sessionId={card.sessionId} draft={draft} setDraft={setDraft} busy={busy} fallbackModel={fallbackModel} rpc={rpc} contextCards={contextCards} sourceCard={card} onSend={onSend} onCommand={onCommand} /></div> : <><h3 title={card.title}>{title}</h3><div className="atlas-card-summary" title={live?.trim() || card.summary}>{summary}</div><footer className="atlas-card-footer"><span>{fileCount > 0 && <><FileText className="size-3.5" />{fileCount}</>}{card.tools > 0 && <>{fileCount > 0 && ' · '}<Wrench className="size-3.5" />{card.tools}</>}{card.todos > 0 && ` · 待办 ${card.todos}`}</span><div className="atlas-card-actions"><button onClick={event => { event.stopPropagation(); onOpen() }}>查看详情</button><button onClick={event => { event.stopPropagation(); onOpenDsh() }}>返回 DSH</button><button onClick={event => { event.stopPropagation(); onArchive() }}>存档</button></div></footer></>}
+    <header><div className="flex items-center gap-2"><span className="atlas-card-dot" /><Badge>{isFreshConversation ? '新对话' : card.parentSessionId ? '另一种思路' : '对话'}</Badge>{card.marker.important && <span className="atlas-marker-chip">重点</span>}{card.marker.kind !== 'none' && <span className={`atlas-marker-chip is-${card.marker.kind}`}>{markerLabel(card.marker.kind)}</span>}</div><div className="atlas-card-menu-wrap" data-no-drag><button className="atlas-card-menu-trigger" onClick={event => { event.stopPropagation(); onMenuOpenChange(!menuOpen) }} aria-label={`打开 ${card.title} 的卡片菜单`} aria-expanded={menuOpen} title="卡片状态"><MoreHorizontal className="size-4" /></button>{menuOpen && <div className="atlas-card-menu atlas-card-status-menu" role="menu"><div className="atlas-card-menu-label">卡片状态</div><button role="menuitemcheckbox" aria-checked={card.marker.important} onClick={event => { event.stopPropagation(); choose({ ...card.marker, important: !card.marker.important }) }}><Check className={`size-3.5 ${card.marker.important ? '' : 'invisible'}`} />重点</button>{(['conclusion', 'verify'] as MarkerKind[]).map(kind => <button key={kind} role="menuitemcheckbox" aria-checked={card.marker.kind === kind} onClick={event => { event.stopPropagation(); choose({ ...card.marker, kind: card.marker.kind === kind ? 'none' : kind }) }}><Check className={`size-3.5 ${card.marker.kind === kind ? '' : 'invisible'}`} />{markerLabel(kind)}</button>)}<button role="menuitem" className="is-danger" onClick={event => { event.stopPropagation(); onMenuOpenChange(false); onDelete() }}><Trash2 className="size-3.5" />删除卡片</button></div>}</div></header>{isFreshConversation ? <div className="atlas-fresh-conversation" data-no-drag><h3>开始新对话</h3><p>输入消息以开始当前会话</p><NativeComposer sessionId={card.sessionId} draft={draft} setDraft={setDraft} busy={busy} fallbackModel={fallbackModel} rpc={rpc} contextCards={contextCards} sourceCard={card} onSend={onSend} onCommand={onCommand} /></div> : <><h3 title={card.title}>{title}</h3><div className="atlas-card-summary" title={live?.trim() || card.summary}>{summary}</div><footer className="atlas-card-footer"><span>{fileCount > 0 && <><FileText className="size-3.5" />{fileCount}</>}{card.tools > 0 && <>{fileCount > 0 && ' · '}<Wrench className="size-3.5" />{card.tools}</>}{card.todos > 0 && ` · 待办 ${card.todos}`}</span><div className="atlas-card-actions"><button onClick={event => { event.stopPropagation(); onOpen() }}>查看详情</button><button onClick={event => { event.stopPropagation(); onOpenDsh() }}>返回 DSH</button><button onClick={event => { event.stopPropagation(); onArchive() }}>存档</button></div></footer><CardMetricsBar metrics={card.metrics} /></>}
   </article>
+}
+function CardMetricsBar({ metrics }: { metrics?: CardMetrics | null }) {
+  if (!metrics) return null
+  const items = [
+    finiteMetric(metrics.llmMs) && ['LLM', formatMetricDuration(metrics.llmMs!)],
+    finiteMetric(metrics.ttftAverageMs) && ['首 token', formatMetricDuration(metrics.ttftAverageMs!)],
+    finiteMetric(metrics.tokensPerSecond) && ['速率', `${formatMetricRate(metrics.tokensPerSecond!)} tok/s`],
+    finiteMetric(metrics.cacheHitPercent) && ['缓存', `${Math.round(metrics.cacheHitPercent!)}%`],
+    finiteMetric(metrics.inputTokens) && finiteMetric(metrics.outputTokens) && ['Token', `${formatMetricTokens(metrics.inputTokens!)} → ${formatMetricTokens(metrics.outputTokens!)}`],
+  ].filter(Boolean) as string[][]
+  if (items.length === 0) return null
+  return <div className="atlas-card-metrics" aria-label="本卡片模型性能汇总" title="本卡片内所有 LLM 调用的聚合结果">{items.map(([label, value]) => <span key={label}><small>{label}</small><strong>{value}</strong></span>)}</div>
 }
 function SessionNav({ node, activeSession, canvasRoot, expanded, onToggle, onSelect, selectionMode, selectedSessionIds, onSelectForDelete, depth = 0 }: { node: SessionNode; activeSession: string; canvasRoot: string; expanded: Set<string>; onToggle: (id: string) => void; onSelect: (card: Card) => void; selectionMode: boolean; selectedSessionIds: Set<string>; onSelectForDelete: (id: string) => void; depth?: number }) {
   const isExpanded = expanded.has(node.id)
@@ -774,13 +870,16 @@ function conversationCards(cards: Card[], rootId: string) {
 function matchesCard(card: Card, query: string, filter: Filter) {
   if (filter === 'tools' && card.tools === 0) return false
   if (filter === 'todos' && card.todos === 0) return false
+  if (filter === 'attachments' && !cardHasAttachments(card)) return false
   if (filter === 'marked' && !card.marker.important) return false
-  if (filter !== 'all' && filter !== 'tools' && filter !== 'todos' && filter !== 'marked' && card.marker.kind !== filter) return false
+  if (filter !== 'all' && filter !== 'tools' && filter !== 'todos' && filter !== 'attachments' && filter !== 'marked' && card.marker.kind !== filter) return false
   const needle = query.trim().toLocaleLowerCase()
   if (needle === '') return true
   const haystack = [card.title, card.summary, ...card.tasks.map(task => `${task.content} ${task.status}`), ...card.messages.flatMap(message => [message.text, ...message.process.flatMap(item => [item.name, item.arguments ?? '', item.result ?? '', item.error ?? ''])])].join('\n').toLocaleLowerCase()
   return haystack.includes(needle)
 }
+function cardAttachmentCount(card: Card) { return card.messages.reduce((total, message) => total + splitAttachmentMessage(message.text).attachments.length, 0) }
+function cardHasAttachments(card: Card) { return cardAttachmentCount(card) > 0 }
 function markerLabel(kind: MarkerKind) {
   return ({ conclusion: '关键结论', verify: '待验证', ruleout: '已排除', decision: '已决定', pivot: '已转向', open: '开放问题', none: '' } as Record<MarkerKind, string>)[kind]
 }
@@ -794,6 +893,10 @@ async function savePosition(id: string, position: Point) { await fetch(`/atlas/a
 async function saveCardSize(id: string, size: CardSize) { await fetch(`/atlas/api/cards/${encodeURIComponent(id)}/size`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ size }) }).catch(() => {}) }
 function without(record: Record<string, string>, id: string) { const next = { ...record }; delete next[id]; return next }
 function finite(value: unknown, fallback: number) { return Number.isFinite(Number(value)) ? Number(value) : fallback }
+function finiteMetric(value: unknown): value is number { return typeof value === 'number' && Number.isFinite(value) && value >= 0 }
+function formatMetricDuration(ms: number) { const seconds = ms / 1000; return `${seconds < 1 ? Math.round(seconds * 100) / 100 : Math.round(seconds * 10) / 10}s` }
+function formatMetricRate(value: number) { return String(value >= 10 ? Math.round(value) : Math.round(value * 10) / 10) }
+function formatMetricTokens(value: number) { return value < 1000 ? String(Math.round(value)) : value < 1_000_000 ? `${Math.round(value / 100) / 10}K` : `${Math.round(value / 100_000) / 10}M` }
 function number3(value: unknown): [number, number, number] { const items = Array.isArray(value) ? value : []; return [finite(items[0], 0), finite(items[1], 0), finite(items[2], 0)] }
 function validColor(value: unknown) { return typeof value === 'string' && /^(?:#[0-9a-f]{3,8}|[a-z]+)$/i.test(value.trim()) ? value.trim() : null }
 function formatBytes(value: number) { return value < 1024 ? `${value} B` : value < 1024 * 1024 ? `${Math.round(value / 102.4) / 10} KB` : `${Math.round(value / 104857.6) / 10} MB` }
@@ -801,6 +904,7 @@ const MAX_ATTACHMENT_BYTES = 12 * 1024 * 1024
 const MAX_ATTACHMENT_TOTAL_BYTES = 24 * 1024 * 1024
 const MAX_ATTACHMENT_TEXT_LENGTH = 48_000
 const MAX_ATTACHMENT_TOTAL_TEXT_LENGTH = 96_000
+const MAX_CONVERSATION_CONTEXT_LENGTH = 24_000
 type ExtractedAttachment = { name: string; kind: AttachmentKind; text: string; meta: FileAttachment }
 
 async function extractFileAttachment(file: File): Promise<ExtractedAttachment> {
@@ -808,7 +912,7 @@ async function extractFileAttachment(file: File): Promise<ExtractedAttachment> {
   if (kind === null) {
     const extension = file.name.split('.').at(-1)?.toLowerCase()
     if (extension === 'doc') throw new Error(`暂不支持旧版 Word 文档：${file.name}。请另存为 .docx 后再上传`)
-    throw new Error(`暂不支持此文件类型：${file.name}。可上传 PDF、.docx、.xlsx/.xls、CSV 或文本文件`)
+    throw new Error(`暂不支持此文件类型：${file.name}。可上传 PDF、.docx、.xlsx/.xls、CSV、代码或配置文件`)
   }
   let text = ''
   if (kind === 'pdf') {
@@ -854,11 +958,18 @@ function attachmentKind(file: File): AttachmentKind | null {
   if (extension === 'pdf') return 'pdf'
   if (extension === 'docx') return 'word'
   if (extension === 'xlsx' || extension === 'xls') return 'spreadsheet'
-  if (['txt', 'md', 'json', 'csv', 'ts', 'tsx', 'js', 'jsx', 'py', 'java', 'go', 'rs', 'css', 'html', 'xml', 'yaml', 'yml', 'toml', 'ini', 'log'].includes(extension)) return 'text'
+  if (['ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'py', 'java', 'go', 'rs', 'rb', 'php', 'c', 'h', 'cpp', 'cc', 'cxx', 'hpp', 'cs', 'swift', 'kt', 'kts', 'scala', 'sh', 'bash', 'zsh', 'ps1', 'sql', 'css', 'scss', 'less', 'html', 'htm', 'xml', 'svg', 'vue', 'svelte', 'astro', 'json', 'jsonc', 'yaml', 'yml', 'toml', 'ini', 'cfg', 'conf', 'properties', 'graphql', 'gql'].includes(extension) || ['dockerfile', 'makefile', '.env'].includes(file.name.toLowerCase())) return 'code'
+  if (['txt', 'md', 'rtf', 'csv', 'log', 'lock'].includes(extension)) return 'text'
   return null
 }
-function attachmentMime(kind: AttachmentKind) { return ({ pdf: 'application/pdf', word: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', spreadsheet: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', text: 'text/plain' } as Record<AttachmentKind, string>)[kind] }
-function attachmentLabel(kind: AttachmentKind) { return ({ pdf: 'PDF', word: 'Word', spreadsheet: 'Excel', text: '文本' } as Record<AttachmentKind, string>)[kind] }
+function attachmentMime(kind: AttachmentKind) { return ({ pdf: 'application/pdf', word: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', spreadsheet: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', code: 'text/plain', text: 'text/plain' } as Record<AttachmentKind, string>)[kind] }
+function attachmentLabel(kind: AttachmentKind) { return ({ pdf: 'PDF', word: 'Word', spreadsheet: 'Excel', code: '代码/配置', text: '文本' } as Record<AttachmentKind, string>)[kind] }
+function permissionName(value?: string, fallback?: string) {
+  if (value === 'read-only') return '只读'
+  if (value === 'workspace-write') return '工作区写入'
+  if (value === 'danger-full-access') return '全部权限'
+  return fallback || value || '权限范围'
+}
 function escapeAttachmentAttribute(value: string) { return value.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;').replaceAll('>', '&gt;') }
 function serializeContextItem(item: ContextItem) {
   if (item.kind === 'file' && item.attachment) {
@@ -873,7 +984,7 @@ function splitAttachmentMessage(text: string) {
   const body = text.replace(/<atlas_attachment\s+([^>]*)>[\s\S]*?<\/atlas_attachment>/gi, (_all, rawAttributes: string) => {
     const read = (name: string) => decodeAttachmentAttribute(new RegExp(`${name}="([^"]*)"`, 'i').exec(rawAttributes)?.[1] ?? '')
     const kind = read('kind')
-    const knownKind: AttachmentKind = kind === 'pdf' || kind === 'word' || kind === 'spreadsheet' || kind === 'text' ? kind : 'text'
+    const knownKind: AttachmentKind = kind === 'pdf' || kind === 'word' || kind === 'spreadsheet' || kind === 'code' || kind === 'text' ? kind : 'text'
     const name = read('name') || '未命名文件'
     const size = Number(read('bytes'))
     attachments.push({ name, kind: knownKind, mime: read('mime') || attachmentMime(knownKind), size: Number.isFinite(size) ? size : 0, extractedChars: 0, truncated: read('truncated') === 'true' })

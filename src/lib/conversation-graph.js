@@ -1,4 +1,4 @@
-export const DEFAULT_CARD_SIZE = { width: 480, height: 340 }
+export const DEFAULT_CARD_SIZE = { width: 480, height: 380 }
 export const EMPTY_SESSION_CARD_SIZE = { width: 480, height: 390 }
 const CARD_GAP_X = 96
 const CARD_GAP_Y = 64

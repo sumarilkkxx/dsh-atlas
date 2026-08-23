@@ -90,6 +90,20 @@ export class AtlasStore {
         updated_at TEXT NOT NULL,
         PRIMARY KEY (session_id, call_id)
       );
+      CREATE TABLE IF NOT EXISTS atlas_llm_step (
+        session_id TEXT NOT NULL REFERENCES atlas_node(session_id) ON DELETE CASCADE,
+        turn_number INTEGER NOT NULL,
+        step_number INTEGER NOT NULL,
+        card_source_seq INTEGER,
+        start_time_ms INTEGER,
+        first_token_time_ms INTEGER,
+        completed_time_ms INTEGER,
+        input_tokens INTEGER,
+        output_tokens INTEGER,
+        cache_read_tokens INTEGER,
+        cache_write_tokens INTEGER,
+        PRIMARY KEY (session_id, turn_number, step_number)
+      );
       CREATE TABLE IF NOT EXISTS atlas_conversation_summary (
         root_session_id TEXT PRIMARY KEY,
         revision TEXT NOT NULL,
@@ -100,8 +114,9 @@ export class AtlasStore {
       );
       CREATE INDEX IF NOT EXISTS atlas_node_cwd_idx ON atlas_node(cwd, updated_at DESC);
       CREATE INDEX IF NOT EXISTS atlas_message_session_idx ON atlas_message(session_id, source_seq);
+      CREATE INDEX IF NOT EXISTS atlas_llm_step_card_idx ON atlas_llm_step(session_id, card_source_seq);
       INSERT OR IGNORE INTO atlas_meta(key, value) VALUES ('schema_version', '1');
-      UPDATE atlas_meta SET value = '6' WHERE key = 'schema_version';
+      UPDATE atlas_meta SET value = '7' WHERE key = 'schema_version';
     `)
   }
 
@@ -151,6 +166,11 @@ export class AtlasStore {
       WHERE n.hidden = 0 ${scoped ? 'AND n.cwd = ?' : ''} ORDER BY t.session_id, t.source_seq, t.id`).all(...parameters)
     const tasksBySession = new Map()
     for (const row of taskRows) tasksBySession.set(row.session_id, [...(tasksBySession.get(row.session_id) ?? []), toTask(row)])
+    const metricRows = this.db.prepare(`SELECT s.session_id, s.card_source_seq, s.start_time_ms, s.first_token_time_ms, s.completed_time_ms,
+        s.input_tokens, s.output_tokens, s.cache_read_tokens, s.cache_write_tokens
+      FROM atlas_llm_step s JOIN atlas_node n ON n.session_id = s.session_id
+      WHERE n.hidden = 0 ${scoped ? 'AND n.cwd = ?' : ''} ORDER BY s.session_id, s.card_source_seq, s.turn_number, s.step_number`).all(...parameters)
+    const metricsByCard = aggregateCardMetrics(metricRows)
     const positions = new Map(this.db.prepare('SELECT card_id, x, y FROM atlas_card_position').all().map(row => [row.card_id, { x: row.x, y: row.y }]))
     const sizes = new Map(this.db.prepare('SELECT card_id, width, height FROM atlas_card_size').all().map(row => [row.card_id, { width: row.width, height: row.height }]))
     const cards = []
@@ -162,7 +182,7 @@ export class AtlasStore {
       const turns = messages.filter(message => message.kind === 'user')
       const sessionCards = []
       if (turns.length === 0) {
-        sessionCards.push(this.sessionCard(node, messages, tasks, null, undefined, positions, sizes))
+        sessionCards.push(this.sessionCard(node, messages, tasks, null, undefined, positions, sizes, metricsByCard))
         cards.push(...sessionCards)
         cardsBySession.set(node.session_id, sessionCards)
         lastCardBySession.set(node.session_id, `${node.session_id}:session`)
@@ -173,7 +193,7 @@ export class AtlasStore {
         const range = messages.filter(message => message.sourceSeq >= turn.sourceSeq && (next === undefined || message.sourceSeq < next.sourceSeq))
         const taskRange = tasks.filter(task => task.sourceSeq >= turn.sourceSeq && (next === undefined || task.sourceSeq < next.sourceSeq))
         const previous = index === 0 ? undefined : sessionCards.at(-1)?.id
-        sessionCards.push(this.sessionCard(node, range, taskRange, turn, previous, positions, sizes))
+        sessionCards.push(this.sessionCard(node, range, taskRange, turn, previous, positions, sizes, metricsByCard))
       }
       cards.push(...sessionCards)
       cardsBySession.set(node.session_id, sessionCards)
@@ -193,7 +213,7 @@ export class AtlasStore {
     return { cards: cards.filter(card => !hiddenCards.has(card.id)), workspaces: this.workspaceSummaries(nodes.map(toNode)) }
   }
 
-  sessionCard(node, messages, tasks, turn, parentCardId, positions, sizes) {
+  sessionCard(node, messages, tasks, turn, parentCardId, positions, sizes, metricsByCard) {
     const sourceSeq = turn?.sourceSeq ?? null
     const id = sourceSeq === null ? `${node.session_id}:session` : `${node.session_id}:turn:${sourceSeq}`
     const answer = [...messages].reverse().find(message => message.kind === 'assistant')
@@ -206,6 +226,7 @@ export class AtlasStore {
       sourceSeq, branchSeq: answer?.sourceSeq ?? sourceSeq, parentSessionId: node.parent_session_id, seedLength: node.seed_length,
       parentCardId, position: saved === undefined ? null : { x: saved.x, y: saved.y }, size: savedSize === undefined ? null : { width: savedSize.width, height: savedSize.height },
       tools: process.length, todos: tasks.length, updatedAt: node.updated_at,
+      metrics: sourceSeq === null ? null : metricsByCard.get(`${node.session_id}:${sourceSeq}`) ?? null,
       messages, process, tasks,
     }
   }
@@ -449,6 +470,7 @@ export class AtlasStore {
       this.db.prepare('DELETE FROM atlas_message WHERE session_id = ?').run(session.id)
       this.db.prepare('DELETE FROM atlas_task WHERE session_id = ?').run(session.id)
       this.db.prepare('DELETE FROM atlas_pending_tool WHERE session_id = ?').run(session.id)
+      this.db.prepare('DELETE FROM atlas_llm_step WHERE session_id = ?').run(session.id)
       for (const event of events ?? []) if (event.seq >= replayFrom) this.projectEventInternal(session, event)
       this.db.exec('COMMIT')
     } catch (error) {
@@ -486,6 +508,7 @@ export class AtlasStore {
       this.db.prepare('UPDATE atlas_node SET title = ?, updated_at = ? WHERE session_id = ?').run(titleOf(event.data.title, 'DSH 对话'), eventTime(event), sessionId)
       return
     }
+    if (event.type === 'step/start' || event.type === 'assistant/chunk' || event.type === 'assistant/message') this.foldLlmEvent(sessionId, event)
     if (event.type === 'tool/call' || event.type === 'tool/result') return this.foldToolEvent(sessionId, event)
     const projection = projectable(event)
     if (projection === null) return
@@ -493,6 +516,35 @@ export class AtlasStore {
     if (projection.kind === 'assistant') this.attachPendingTools(sessionId, projection.turn, projection.step, event.seq)
     if (insert.changes > 0) this.db.prepare('UPDATE atlas_node SET updated_at = ?, title = CASE WHEN title = ? AND ? = ? THEN ? ELSE title END WHERE session_id = ?').run(eventTime(event), 'DSH 对话', projection.kind, 'user', titleFromText(displayMessageText(projection.text)), sessionId)
     if (event.type === 'todo/write') this.replaceTasks(sessionId, event)
+  }
+
+  foldLlmEvent(sessionId, event) {
+    const turn = event.data?.turn
+    const step = event.data?.step
+    if (!Number.isSafeInteger(turn) || !Number.isSafeInteger(step)) return
+    const time = eventTimeMs(event)
+    this.db.prepare('INSERT OR IGNORE INTO atlas_llm_step(session_id, turn_number, step_number) VALUES (?, ?, ?)').run(sessionId, turn, step)
+    if (event.type === 'step/start') {
+      this.db.prepare('UPDATE atlas_llm_step SET start_time_ms = COALESCE(start_time_ms, ?) WHERE session_id = ? AND turn_number = ? AND step_number = ?').run(time, sessionId, turn, step)
+      return
+    }
+    if (event.type === 'assistant/chunk') {
+      if (isTokenDelta(event.data?.chunk)) this.db.prepare('UPDATE atlas_llm_step SET first_token_time_ms = COALESCE(first_token_time_ms, ?) WHERE session_id = ? AND turn_number = ? AND step_number = ?').run(time, sessionId, turn, step)
+      if (event.data?.chunk?.type === 'usage') this.updateLlmUsage(sessionId, turn, step, event.data.chunk.usage)
+      return
+    }
+    const card = this.db.prepare(`SELECT source_seq FROM atlas_message
+      WHERE session_id = ? AND kind = 'user' AND source_seq < ? ORDER BY source_seq DESC LIMIT 1`).get(sessionId, event.seq)
+    this.db.prepare(`UPDATE atlas_llm_step SET completed_time_ms = ?, card_source_seq = COALESCE(?, card_source_seq)
+      WHERE session_id = ? AND turn_number = ? AND step_number = ?`).run(time, card?.source_seq ?? null, sessionId, turn, step)
+    if (event.data?.usage !== undefined) this.updateLlmUsage(sessionId, turn, step, event.data.usage)
+  }
+
+  updateLlmUsage(sessionId, turn, step, usage) {
+    const normalized = normalizeUsage(usage)
+    if (normalized === null) return
+    this.db.prepare(`UPDATE atlas_llm_step SET input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_write_tokens = ?
+      WHERE session_id = ? AND turn_number = ? AND step_number = ?`).run(normalized.inputTokens, normalized.outputTokens, normalized.cacheReadTokens, normalized.cacheWriteTokens, sessionId, turn, step)
   }
 
   foldToolEvent(sessionId, event) {
@@ -600,6 +652,55 @@ function projectable(event) {
 }
 
 function note(kind, text, turn, step) { const normalized = String(text ?? '').trim(); return normalized === '' ? null : { kind, text: normalized.slice(0, MAX_TEXT_LENGTH), turn: Number.isSafeInteger(turn) ? turn : null, step: Number.isSafeInteger(step) ? step : null } }
+function isTokenDelta(chunk) {
+  if (chunk?.type === 'text-delta' || chunk?.type === 'reasoning-delta') return chunk.text !== ''
+  return chunk?.type === 'tool-call-delta' && (chunk.argumentsDelta !== '' || chunk.name !== undefined)
+}
+function normalizeUsage(usage) {
+  const inputTokens = nonnegativeInteger(usage?.inputTokens)
+  const outputTokens = nonnegativeInteger(usage?.outputTokens)
+  if (inputTokens === null || outputTokens === null) return null
+  return { inputTokens, outputTokens, cacheReadTokens: nonnegativeInteger(usage?.cacheReadTokens) ?? 0, cacheWriteTokens: nonnegativeInteger(usage?.cacheWriteTokens) ?? 0 }
+}
+function nonnegativeInteger(value) { return Number.isSafeInteger(value) && value >= 0 ? value : null }
+function aggregateCardMetrics(rows) {
+  const totals = new Map()
+  for (const row of rows) {
+    if (!Number.isSafeInteger(row.card_source_seq)) continue
+    const key = `${row.session_id}:${row.card_source_seq}`
+    const value = totals.get(key) ?? { llmMs: 0, llmSteps: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, usageSteps: 0 }
+    if (Number.isFinite(row.start_time_ms) && Number.isFinite(row.completed_time_ms)) {
+      value.llmMs += Math.max(0, row.completed_time_ms - row.start_time_ms)
+      value.llmSteps += 1
+      if (Number.isFinite(row.first_token_time_ms)) {
+        value.ttftMs += Math.max(0, row.first_token_time_ms - row.start_time_ms)
+        value.ttftSteps += 1
+        if (Number.isSafeInteger(row.output_tokens) && row.output_tokens >= 0) {
+          value.decodeMs += Math.max(0, row.completed_time_ms - row.first_token_time_ms)
+          value.decodeTokens += row.output_tokens
+        }
+      }
+    }
+    if (Number.isSafeInteger(row.input_tokens) && Number.isSafeInteger(row.output_tokens)) {
+      value.inputTokens += row.input_tokens + (row.cache_read_tokens ?? 0) + (row.cache_write_tokens ?? 0)
+      value.outputTokens += row.output_tokens
+      value.cacheReadTokens += row.cache_read_tokens ?? 0
+      value.cacheWriteTokens += row.cache_write_tokens ?? 0
+      value.usageSteps += 1
+    }
+    totals.set(key, value)
+  }
+  return new Map([...totals].map(([key, value]) => {
+    const cacheDenominator = value.inputTokens
+    return [key, {
+      ...(value.llmSteps > 0 ? { llmMs: value.llmMs } : {}),
+      ...(value.ttftSteps > 0 ? { ttftAverageMs: value.ttftMs / value.ttftSteps } : {}),
+      ...(value.decodeMs > 0 ? { tokensPerSecond: value.decodeTokens / (value.decodeMs / 1000) } : {}),
+      ...(value.usageSteps > 0 ? { inputTokens: value.inputTokens, outputTokens: value.outputTokens } : {}),
+      ...(value.usageSteps > 0 && cacheDenominator > 0 ? { cacheHitPercent: value.cacheReadTokens / cacheDenominator * 100 } : {}),
+    }]
+  }).filter(([, value]) => Object.keys(value).length > 0))
+}
 function contentText(content) { return Array.isArray(content) ? content.flatMap(block => block?.type === 'text' ? [block.text] : block?.type === 'tool-result' ? [contentText(block.content)] : []).filter(value => typeof value === 'string' && value.trim() !== '').join('\n') : '' }
 function toolPresentationMeta(message) {
   const direct = message?.meta ?? message?.presentationMeta
@@ -635,6 +736,7 @@ function displayMessageText(text) {
 function boundedCoordinate(value) { const number = Number(value); if (!Number.isFinite(number)) throw new AtlasInputError('position must be finite'); return Math.round(Math.max(-4000, Math.min(8000, number))) }
 function boundedCardDimension(value, minimum, maximum, name) { const number = Number(value); if (!Number.isFinite(number)) throw new AtlasInputError(`${name} must be finite`); return Math.round(Math.max(minimum, Math.min(maximum, number))) }
 function eventTime(event) { return typeof event?.time === 'string' ? event.time : Number.isFinite(event?.time) ? new Date(event.time).toISOString() : now() }
+function eventTimeMs(event) { const value = typeof event?.time === 'string' ? Date.parse(event.time) : Number(event?.time); return Number.isFinite(value) ? Math.round(value) : Date.now() }
 function now() { return new Date().toISOString() }
 function toNode(row) { return { id: row.session_id, cwd: row.cwd, title: row.title, parentSessionId: row.parent_session_id, seedLength: row.seed_length, position: { x: row.x, y: row.y }, hidden: row.hidden === 1, updatedAt: row.updated_at } }
 function toMessage(row) { return { sourceSeq: row.source_seq, kind: row.kind, text: row.text, turn: row.turn_number, step: row.step_number, process: row.process_json === null ? [] : JSON.parse(row.process_json), at: row.at } }

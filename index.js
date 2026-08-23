@@ -101,7 +101,8 @@ async function projectColdSessions(sessionQuery, store) {
     while (cursor < records.length) {
       const record = records[cursor++]
       const snapshot = await sessionQuery.readSession(record.header.id)
-      await store.replaceSessionProjection({ id: snapshot.session.id, header: snapshot.session }, snapshot.events)
+      const replayFrom = snapshot.session?.parentSession === undefined ? 0 : Number.isSafeInteger(snapshot.session.seedLength) ? snapshot.session.seedLength : 0
+      await store.replaceSessionProjection({ id: snapshot.session.id, header: snapshot.session }, snapshot.events, replayFrom)
     }
   })
   await Promise.all(workers)

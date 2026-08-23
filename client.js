@@ -42,8 +42,15 @@ window.__ModuleLoader__.load({
         await directory.load()
         return { directory, snapshot: directory.store.getSnapshot() }
       }
+      const permissionDirectory = sessionId => {
+        const session = sessionFace(sessionId)
+        const face = session.projections.faceOf('permissions')
+        const value = face.getSnapshot()
+        if (value === undefined || value === null || !Array.isArray(value.options)) throw new Error('当前 DSH Profile 未提供权限范围投影')
+        return { face, session, snapshot: { currentValue: value.currentValue, options: value.options.filter(option => option?.value !== 'custom') } }
+      }
       const style = document.createElement('style')
-      style.textContent = '.dsh-atlas-switch{position:fixed;z-index:120;top:12px;left:50%;display:flex;gap:2px;transform:translateX(-50%);border:1px solid #d9e0e4;border-radius:999px;background:rgba(255,255,255,.96);padding:3px;backdrop-filter:blur(10px)}.dsh-atlas-switch button{height:28px;border:0;border-radius:999px;background:transparent;padding:0 11px;color:#5b6876;font:600 12px "Microsoft YaHei UI","PingFang SC","Segoe UI",sans-serif;cursor:pointer}.dsh-atlas-switch button.active{background:#172033;color:#fff}.dsh-atlas-switch button:focus-visible{outline:2px solid #0b9b83;outline-offset:2px}.dsh-atlas-overlay{position:fixed;z-index:100;inset:0;background:#f7f8fa}.dsh-atlas-overlay[hidden]{display:none}.dsh-atlas-overlay iframe{display:block;width:100%;height:100%;border:0}'
+      style.textContent = '.dsh-atlas-switch{position:fixed;z-index:120;top:12px;left:50%;display:flex;gap:2px;transform:translateX(-50%);border:1px solid #d9e0e4;border-radius:999px;background:rgba(255,255,255,.96);padding:3px;backdrop-filter:blur(10px);-webkit-app-region:no-drag}.dsh-atlas-switch button{height:28px;border:0;border-radius:999px;background:transparent;padding:0 11px;color:#5b6876;font:600 12px "Microsoft YaHei UI","PingFang SC","Segoe UI",sans-serif;cursor:pointer;-webkit-app-region:no-drag}.dsh-atlas-switch button.active{background:#172033;color:#fff}.dsh-atlas-switch button:focus-visible{outline:2px solid #0b9b83;outline-offset:2px}.dsh-atlas-overlay{position:fixed;z-index:100;inset:0;background:#f7f8fa}.dsh-atlas-overlay[hidden]{display:none}.dsh-atlas-overlay iframe{display:block;width:100%;height:100%;border:0}'
       document.head.append(style)
       const host = document.createElement('div')
       host.className = 'dsh-atlas-host'
@@ -183,13 +190,52 @@ window.__ModuleLoader__.load({
           }).catch(error => send('atlas:error', { requestId: event.data.requestId, message: error instanceof Error ? error.message : '无法读取 DSH 技能目录' }))
           return
         }
+        if (event.data.type === 'atlas:get-permissions') {
+          Promise.resolve().then(() => {
+            const { snapshot } = permissionDirectory(event.data.sessionId)
+            send('atlas:permission-directory', { requestId: event.data.requestId, permissions: snapshot })
+          }).catch(error => send('atlas:error', { requestId: event.data.requestId, message: error instanceof Error ? error.message : '权限范围加载失败' }))
+          return
+        }
+        if (event.data.type === 'atlas:select-permission') {
+          const preset = typeof event.data.preset === 'string' ? event.data.preset.trim() : ''
+          Promise.resolve().then(async () => {
+            const initial = permissionDirectory(event.data.sessionId)
+            if (!initial.snapshot.options.some(option => option.value === preset)) throw new Error('该权限范围不在当前 DSH 会话的可用预设中')
+            const result = await initial.session.command(`/permission ${preset}`)
+            if (!result.ok) throw new Error(result.error?.message ?? 'DSH 未接受权限切换')
+            if (result.value?.matched !== true) throw new Error('当前 DSH Profile 未启用 /permission 命令')
+            let snapshot = permissionDirectory(event.data.sessionId).snapshot
+            for (let attempt = 0; attempt < 8 && snapshot.currentValue !== preset; attempt += 1) {
+              await new Promise(resolve => window.setTimeout(resolve, 120 * (attempt + 1)))
+              snapshot = permissionDirectory(event.data.sessionId).snapshot
+            }
+            if (snapshot.currentValue !== preset) throw new Error('DSH 未确认权限切换，Atlas 不会仅更新页面显示')
+            send('atlas:permission-selected', { requestId: event.data.requestId, permissions: snapshot })
+          }).catch(error => send('atlas:error', { requestId: event.data.requestId, message: error instanceof Error ? error.message : '权限范围切换失败' }))
+          return
+        }
         if (event.data.type === 'atlas:select-model') {
           const selection = event.data.selection
           if (selection === null || typeof selection !== 'object' || typeof selection.provider !== 'string' || typeof selection.model !== 'string') return send('atlas:error', { requestId: event.data.requestId, message: '模型选择参数无效' })
           Promise.resolve().then(async () => {
             const directory = ctx.modelDirectories.directoryFor(event.data.sessionId)
-            await directory.select({ provider: selection.provider, model: selection.model, ...(typeof selection.reasoningEffort === 'string' ? { reasoningEffort: selection.reasoningEffort } : {}) })
-            send('atlas:model-selected', { requestId: event.data.requestId, directory: directory.store.getSnapshot() })
+            const catalog = await directory.load()
+            const provider = selection.provider.trim()
+            const model = selection.model.trim()
+            const available = catalog.groups?.some(group => group.id === provider && group.models?.some(item => item.id === model))
+            if (!available) throw new Error('该模型不在当前 DSH 会话的可用模型目录中，请刷新后重试')
+            const requested = { provider, model, ...(typeof selection.reasoningEffort === 'string' && selection.reasoningEffort.trim() !== '' ? { reasoningEffort: selection.reasoningEffort } : {}) }
+            await directory.select(requested)
+            let snapshot = directory.store.getSnapshot()
+            for (let attempt = 0; attempt < 3 && (snapshot.current?.provider !== requested.provider || snapshot.current.model !== requested.model); attempt += 1) {
+              await new Promise(resolve => window.setTimeout(resolve, 120 * (attempt + 1)))
+              await directory.load()
+              snapshot = directory.store.getSnapshot()
+            }
+            const current = snapshot.current
+            if (current?.provider !== requested.provider || current.model !== requested.model) throw new Error('DSH 未确认模型切换，Atlas 不会仅更新页面显示')
+            send('atlas:model-selected', { requestId: event.data.requestId, directory: snapshot })
           }).catch(error => send('atlas:error', { requestId: event.data.requestId, message: error instanceof Error ? error.message : '模型切换失败' }))
           return
         }
