@@ -113,11 +113,21 @@ window.__ModuleLoader__.load({
       }
       const liveUnsubscribers = new Map()
       const liveRunning = new Map()
+      const liveToolCalls = new Map()
+      const livePartialText = new Map()
       let refreshTimer = null
+      let settledRefreshTimer = null
       const refreshAfterProjection = (delay = 180) => {
         if (refreshTimer !== null) window.clearTimeout(refreshTimer)
         refreshTimer = window.setTimeout(() => {
           refreshTimer = null
+          if (!overlay.hidden) send('atlas:refresh')
+        }, delay)
+      }
+      const refreshAfterSettledProjection = (delay = 420) => {
+        if (settledRefreshTimer !== null) window.clearTimeout(settledRefreshTimer)
+        settledRefreshTimer = window.setTimeout(() => {
+          settledRefreshTimer = null
           if (!overlay.hidden) send('atlas:refresh')
         }, delay)
       }
@@ -134,13 +144,49 @@ window.__ModuleLoader__.load({
             const wasRunning = liveRunning.get(id) === true
             liveRunning.set(id, state.running === true)
             const text = state.partial?.blocks.filter(block => block.kind === 'text').map(block => block.text).join('\n') ?? ''
-            send('atlas:live-reply', { sessionId: id, running: state.running, text })
+            const reasoning = state.partial?.blocks.some(block => block.kind === 'reasoning') === true
+            const runningCalls = Array.isArray(state.runningCalls) ? state.runningCalls.map(call => String(call?.name ?? '').trim()).filter(Boolean) : []
+            const previousCalls = liveToolCalls.get(id) ?? []
+            const previousText = livePartialText.get(id) ?? ''
+            let activity = null
+            if (state.running === true) {
+              if (runningCalls.length > 0) {
+                const visibleNames = [...new Set(runningCalls)].slice(0, 2)
+                const suffix = runningCalls.length > visibleNames.length ? ` 等 ${runningCalls.length} 个工具` : ''
+                activity = { kind: 'tool', status: 'running', label: `正在调用 ${visibleNames.join('、')}${suffix}` }
+              } else if (previousCalls.length > 0 && text === previousText) {
+                const visibleNames = [...new Set(previousCalls)].slice(0, 2)
+                activity = { kind: 'tool', status: 'completed', label: `${visibleNames.join('、')} 已完成，正在处理结果` }
+                // Tool results (including render_artifact payloads) are durable
+                // before the model starts its next step. Refresh here so an
+                // already-open Atlas detail can render them immediately.
+                refreshAfterProjection(60)
+                // Keep a trailing refresh as well. Certain image/artifact tool
+                // chains publish their final turn/end after the tool snapshot
+                // but never emit the expected running=false transition.
+                refreshAfterSettledProjection()
+              } else if (text !== previousText && text.trim() !== '') {
+                activity = { kind: 'reply', status: 'running', label: '正在生成回答' }
+                // Some artifact/image tool chains leave the transient DSH
+                // snapshot in `running` even after the durable assistant
+                // message and turn/end event have landed. Debounce a projection
+                // refresh after text settles so Atlas can converge on Session Log.
+                refreshAfterProjection(320)
+              } else {
+                activity = { kind: reasoning ? 'thinking' : 'thinking', status: 'running', label: reasoning ? '正在思考' : '正在准备回答' }
+              }
+            }
+            if (runningCalls.length > 0) liveToolCalls.set(id, runningCalls)
+            else liveToolCalls.delete(id)
+            if (state.running === true) livePartialText.set(id, text)
+            else livePartialText.delete(id)
+            send('atlas:live-reply', { sessionId: id, running: state.running, text, activity })
             if (wasRunning && state.running !== true) refreshAfterProjection()
           }
           liveUnsubscribers.set(id, session.subscribe(publish))
           publish()
         }
-        for (const [id, unsubscribe] of liveUnsubscribers) if (!snapshot.ids.includes(id)) { unsubscribe(); liveUnsubscribers.delete(id); liveRunning.delete(id) }
+        for (const [id, unsubscribe] of liveUnsubscribers) if (!snapshot.ids.includes(id)) { unsubscribe(); liveUnsubscribers.delete(id); liveRunning.delete(id); liveToolCalls.delete(id); livePartialText.delete(id) }
       }
       const setView = atlas => {
         dialogButton.classList.toggle('active', !atlas)
@@ -243,19 +289,40 @@ window.__ModuleLoader__.load({
           const line = typeof event.data.line === 'string' ? event.data.line.trim() : ''
           if (!line.startsWith('/')) return send('atlas:error', { requestId: event.data.requestId, message: '命令必须以 / 开头' })
           const face = sessionFace(event.data.sessionId)
-          Promise.resolve(face.command(line)).then(async result => {
+          const executionKey = typeof event.data.requestId === 'string' ? event.data.requestId : `${Date.now()}`
+          const commandUrl = `/atlas/api/sessions/${encodeURIComponent(event.data.sessionId)}/commands`
+          const persisted = fetch(commandUrl, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ executionKey, line, status: 'running' }) }).then(async response => {
+            if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error ?? '无法创建 Atlas 命令卡片')
+            refreshAfterProjection(40)
+          })
+          send('atlas:command-accepted', { requestId: event.data.requestId, result: { executionKey, execution: { sessionId: event.data.sessionId, line }, status: { running: true } } })
+          Promise.resolve().then(() => ctx.remote.commands.execute(event.data.sessionId, line)).then(async result => {
             if (!result.ok) throw new Error(result.error?.message ?? 'DSH 未接受该命令')
-            if (result.value?.matched !== true && line === '/status') {
+            let resultText = result.value?.result?.text
+            if (result.value === undefined && line === '/status') {
               const state = typeof face.getSnapshot === 'function' ? face.getSnapshot() : {}
               const directory = ctx.modelDirectories.directoryFor(event.data.sessionId)
               await directory.load().catch(() => undefined)
               const current = directory.store.getSnapshot().current
-              send('atlas:command-ran', { requestId: event.data.requestId, result: { matched: true, status: { running: state.running === true, model: current?.model, effort: current?.reasoningEffort } } })
-              return
+              resultText = `当前模型：${current?.model ?? '未知'}；推理等级：${current?.reasoningEffort ?? '默认'}；会话状态：${state.running === true ? '运行中' : '空闲'}`
+            } else {
+              if (result.value === undefined) throw new Error(`未知命令：${line}`)
+              if (result.value.result?.kind === 'error') throw new Error(result.value.result.text ?? '命令执行失败')
             }
-            if (result.value?.matched !== true) throw new Error(`未知命令：${line}`)
-            send('atlas:command-ran', { requestId: event.data.requestId, result: result.value })
-          }).catch(error => send('atlas:error', { requestId: event.data.requestId, message: error instanceof Error ? error.message : '命令执行失败' }))
+            await persisted
+            const response = await fetch(`${commandUrl}/${encodeURIComponent(executionKey)}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ status: 'completed', resultText }) })
+            if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error ?? '命令已完成，但 Atlas 卡片更新失败')
+            send('atlas:command-finished', { executionKey, sessionId: event.data.sessionId, status: 'completed' })
+            refreshAfterProjection(40)
+          }).catch(async error => {
+            const message = error instanceof Error ? error.message : '命令执行失败'
+            try {
+              await persisted
+              await fetch(`${commandUrl}/${encodeURIComponent(executionKey)}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ status: 'error', resultText: message }) })
+            } catch { /* the command error remains the useful user-facing failure */ }
+            send('atlas:command-finished', { executionKey, sessionId: event.data.sessionId, status: 'error', message })
+            refreshAfterProjection(40)
+          })
           return
         }
         if (event.data.type === 'atlas:send-message') {
@@ -285,6 +352,7 @@ window.__ModuleLoader__.load({
         themeObserver?.disconnect()
         for (const unsubscribe of liveUnsubscribers.values()) unsubscribe()
         if (refreshTimer !== null) window.clearTimeout(refreshTimer)
+        if (settledRefreshTimer !== null) window.clearTimeout(settledRefreshTimer)
         dialogButton.removeEventListener('click', close)
         atlasButton.removeEventListener('click', open)
         window.removeEventListener('message', onMessage)

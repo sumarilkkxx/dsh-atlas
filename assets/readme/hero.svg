@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="420" viewBox="0 0 1200 420" role="img" aria-labelledby="title desc">
+  <title id="title">DSH Atlas</title>
+  <desc id="desc">把线性对话历史变成可继续工作的会话画布</desc>
+  <rect width="1200" height="420" rx="28" fill="#F7F8FA"/>
+  <path d="M0 314C178 267 342 352 522 314S858 239 1200 302V420H0Z" fill="#EEF5FC"/>
+  <g font-family="Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+    <g transform="translate(64 62)">
+      <rect width="42" height="42" rx="12" fill="#111827"/>
+      <path d="M12 27.5 21 10l9 17.5-9-4.8-9 4.8Z" fill="#FFFFFF"/>
+      <circle cx="21" cy="30" r="3" fill="#69B5FF"/>
+      <text x="58" y="15" font-size="14" font-weight="700" letter-spacing="1.8" fill="#667085">DEEPSEEK HARNESS</text>
+      <text x="58" y="37" font-size="14" font-weight="600" fill="#0A7BEA">VISUAL SESSION WORKSPACE</text>
+      <text x="0" y="126" font-size="64" font-weight="760" letter-spacing="-2.4" fill="#111827">DSH Atlas</text>
+      <text x="0" y="174" font-size="25" font-weight="590" fill="#344054">把线性对话历史变成</text>
+      <text x="0" y="210" font-size="25" font-weight="590" fill="#344054">可继续工作的会话画布。</text>
+      <g transform="translate(0 252)" font-size="14" font-weight="650">
+        <rect width="92" height="34" rx="17" fill="#EAF4FF" stroke="#B7D9FA"/>
+        <text x="46" y="22" text-anchor="middle" fill="#0969C3">会话卡片</text>
+        <rect x="104" width="92" height="34" rx="17" fill="#FFFFFF" stroke="#D9DEE7"/>
+        <text x="150" y="22" text-anchor="middle" fill="#475467">真实分支</text>
+        <rect x="208" width="104" height="34" rx="17" fill="#FFFFFF" stroke="#D9DEE7"/>
+        <text x="260" y="22" text-anchor="middle" fill="#475467">原生 DSH</text>
+      </g>
+    </g>
+    <g transform="translate(615 48)">
+      <path d="M112 137C140 137 143 106 170 106C176 106 182 106 188 106" fill="none" stroke="#AAB4C3" stroke-width="3"/>
+      <path d="M310 106C332 106 338 166 353 174C365 182 372 196 388 196" fill="none" stroke="#0A7BEA" stroke-width="3" stroke-dasharray="7 7"/>
+      <path d="M310 106C355 106 340 318 388 318" fill="none" stroke="#C7CED8" stroke-width="3"/>
+      <g transform="translate(0 90)">
+        <rect width="112" height="94" rx="18" fill="#FFFFFF" stroke="#D9DEE7" stroke-width="2"/>
+        <circle cx="20" cy="20" r="4" fill="#98A2B3"/><rect x="34" y="15" width="42" height="10" rx="5" fill="#EAECF0"/>
+        <rect x="18" y="43" width="76" height="8" rx="4" fill="#475467"/><rect x="18" y="61" width="62" height="7" rx="3.5" fill="#D0D5DD"/>
+      </g>
+      <g transform="translate(188 40)">
+        <rect width="122" height="132" rx="20" fill="#FFFFFF" stroke="#69B5FF" stroke-width="3"/>
+        <circle cx="21" cy="22" r="4" fill="#0A7BEA"/><rect x="36" y="17" width="48" height="10" rx="5" fill="#EAF4FF"/>
+        <rect x="18" y="49" width="86" height="9" rx="4.5" fill="#111827"/><rect x="18" y="69" width="76" height="7" rx="3.5" fill="#98A2B3"/>
+        <rect x="18" y="86" width="63" height="7" rx="3.5" fill="#D0D5DD"/><rect x="16" y="106" width="90" height="14" rx="7" fill="#F2F4F7"/>
+      </g>
+      <g transform="translate(388 140)">
+        <rect width="136" height="112" rx="20" fill="#FFFFFF" stroke="#D9DEE7" stroke-width="2"/>
+        <circle cx="21" cy="22" r="4" fill="#248A54"/><rect x="36" y="17" width="64" height="10" rx="5" fill="#E8F5ED"/>
+        <rect x="18" y="49" width="97" height="8" rx="4" fill="#344054"/><rect x="18" y="68" width="80" height="7" rx="3.5" fill="#98A2B3"/>
+        <rect x="18" y="88" width="100" height="11" rx="5.5" fill="#F2F4F7"/>
+      </g>
+      <g transform="translate(388 274)">
+        <rect width="136" height="88" rx="20" fill="#FFFFFF" stroke="#D9DEE7" stroke-width="2"/>
+        <circle cx="21" cy="22" r="4" fill="#C35A06"/><rect x="36" y="17" width="52" height="10" rx="5" fill="#FFF1E6"/>
+        <rect x="18" y="48" width="96" height="8" rx="4" fill="#344054"/><rect x="18" y="66" width="70" height="7" rx="3.5" fill="#D0D5DD"/>
+      </g>
+      <circle cx="170" cy="106" r="12" fill="#FFFFFF" stroke="#D9DEE7" stroke-width="2"/>
+      <path d="M166 106h8M170 102v8" stroke="#667085" stroke-width="2" stroke-linecap="round"/>
+      <circle cx="353" cy="174" r="12" fill="#FFFFFF" stroke="#B7D9FA" stroke-width="2"/>
+      <path d="M349 174h8M353 170v8" stroke="#0A7BEA" stroke-width="2" stroke-linecap="round"/>
+    </g>
+  </g>
+</svg>

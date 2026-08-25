@@ -20,6 +20,39 @@ export function latestCardIds(cards) {
   return new Set(latest.values())
 }
 
+export function liveTextForCard(card, latestIds, liveBySession) {
+  return latestIds.has(card.id) ? liveBySession[card.sessionId] : undefined
+}
+
+export function findPendingProjection(cards, submission) {
+  if (!submission?.sessionId) return undefined
+  const baselineIds = new Set(Array.isArray(submission.baselineCardIds) ? submission.baselineCardIds : [])
+  const expectedText = String(submission.text ?? '').trim()
+  const candidates = cards.filter(card => {
+    if (card.sessionId !== submission.sessionId || baselineIds.has(card.id) || card.sourceSeq === null) return false
+    if (expectedText === '') return true
+    const userMessage = Array.isArray(card.messages)
+      ? card.messages.find(message => message?.kind === 'user' && String(message?.text ?? '').trim() === expectedText)
+      : undefined
+    return userMessage !== undefined || String(card.title ?? '').trim() === expectedText
+  })
+  return candidates.sort((left, right) => (left.sourceSeq ?? Number.MAX_SAFE_INTEGER) - (right.sourceSeq ?? Number.MAX_SAFE_INTEGER))[0]
+}
+
+export function cardHasSettledReply(card) {
+  if (card?.settled === true) return true
+  const messages = Array.isArray(card?.messages) ? card.messages : []
+  const assistants = messages.filter(message => message?.kind === 'assistant' && String(message?.text ?? '').trim() !== '')
+  const latest = assistants.at(-1)
+  if (!latest) return false
+  const process = messages.flatMap(message => Array.isArray(message?.process) ? message.process : [])
+  if (process.length === 0) return true
+  const lastProcessSeq = process.reduce((maximum, item) => Math.max(maximum,
+    Number.isSafeInteger(item?.resultSeq) ? item.resultSeq : Number.isSafeInteger(item?.sourceSeq) ? item.sourceSeq : -1), -1)
+  if (Number.isSafeInteger(latest.sourceSeq) && latest.sourceSeq > lastProcessSeq) return true
+  return !process.some(item => item?.result === null && !item?.error) && lastProcessSeq < 0
+}
+
 export function graphView(cards, collapsed) {
   const children = new Map()
   const knownIds = new Set(cards.map(card => card.id))
