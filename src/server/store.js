@@ -2,6 +2,7 @@ import { mkdir } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
+import { localizeCommandResult } from '../lib/command-copy.js'
 
 const MAX_TEXT_LENGTH = 8_000
 const MAX_TITLE_LENGTH = 160
@@ -104,6 +105,13 @@ export class AtlasStore {
         cache_write_tokens INTEGER,
         PRIMARY KEY (session_id, turn_number, step_number)
       );
+      CREATE TABLE IF NOT EXISTS atlas_turn_completion (
+        session_id TEXT NOT NULL REFERENCES atlas_node(session_id) ON DELETE CASCADE,
+        card_source_seq INTEGER NOT NULL,
+        completed_seq INTEGER NOT NULL,
+        completed_at TEXT NOT NULL,
+        PRIMARY KEY (session_id, card_source_seq)
+      );
       CREATE TABLE IF NOT EXISTS atlas_conversation_summary (
         root_session_id TEXT PRIMARY KEY,
         revision TEXT NOT NULL,
@@ -112,12 +120,28 @@ export class AtlasStore {
         model TEXT,
         generated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS atlas_command_execution (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL REFERENCES atlas_node(session_id) ON DELETE CASCADE,
+        execution_key TEXT,
+        line TEXT NOT NULL,
+        result_text TEXT,
+        status TEXT NOT NULL DEFAULT 'completed',
+        anchor_source_seq INTEGER,
+        created_at TEXT NOT NULL,
+        updated_at TEXT
+      );
       CREATE INDEX IF NOT EXISTS atlas_node_cwd_idx ON atlas_node(cwd, updated_at DESC);
       CREATE INDEX IF NOT EXISTS atlas_message_session_idx ON atlas_message(session_id, source_seq);
       CREATE INDEX IF NOT EXISTS atlas_llm_step_card_idx ON atlas_llm_step(session_id, card_source_seq);
       INSERT OR IGNORE INTO atlas_meta(key, value) VALUES ('schema_version', '1');
-      UPDATE atlas_meta SET value = '7' WHERE key = 'schema_version';
+      UPDATE atlas_meta SET value = '10' WHERE key = 'schema_version';
     `)
+    const commandColumns = new Set(this.db.prepare('PRAGMA table_info(atlas_command_execution)').all().map(column => column.name))
+    if (!commandColumns.has('execution_key')) this.db.exec('ALTER TABLE atlas_command_execution ADD COLUMN execution_key TEXT')
+    if (!commandColumns.has('status')) this.db.exec("ALTER TABLE atlas_command_execution ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'")
+    if (!commandColumns.has('updated_at')) this.db.exec('ALTER TABLE atlas_command_execution ADD COLUMN updated_at TEXT')
+    this.db.exec("UPDATE atlas_command_execution SET updated_at = COALESCE(updated_at, created_at); CREATE UNIQUE INDEX IF NOT EXISTS atlas_command_execution_key_idx ON atlas_command_execution(execution_key) WHERE execution_key IS NOT NULL;")
   }
 
   async close() {
@@ -171,8 +195,14 @@ export class AtlasStore {
       FROM atlas_llm_step s JOIN atlas_node n ON n.session_id = s.session_id
       WHERE n.hidden = 0 ${scoped ? 'AND n.cwd = ?' : ''} ORDER BY s.session_id, s.card_source_seq, s.turn_number, s.step_number`).all(...parameters)
     const metricsByCard = aggregateCardMetrics(metricRows)
+    const commandRows = this.db.prepare(`SELECT c.id, c.session_id, c.execution_key, c.line, c.result_text, c.status, c.anchor_source_seq, c.created_at, c.updated_at
+      FROM atlas_command_execution c JOIN atlas_node n ON n.session_id = c.session_id
+      WHERE n.hidden = 0 ${scoped ? 'AND n.cwd = ?' : ''} ORDER BY c.session_id, c.anchor_source_seq, c.id`).all(...parameters)
+    const commandsBySession = new Map()
+    for (const row of commandRows) commandsBySession.set(row.session_id, [...(commandsBySession.get(row.session_id) ?? []), row])
     const positions = new Map(this.db.prepare('SELECT card_id, x, y FROM atlas_card_position').all().map(row => [row.card_id, { x: row.x, y: row.y }]))
     const sizes = new Map(this.db.prepare('SELECT card_id, width, height FROM atlas_card_size').all().map(row => [row.card_id, { width: row.width, height: row.height }]))
+    const completedTurns = new Set(this.db.prepare('SELECT session_id, card_source_seq FROM atlas_turn_completion').all().map(row => `${row.session_id}:${row.card_source_seq}`))
     const cards = []
     const cardsBySession = new Map()
     const lastCardBySession = new Map()
@@ -180,9 +210,10 @@ export class AtlasStore {
       const messages = messagesBySession.get(node.session_id) ?? []
       const tasks = tasksBySession.get(node.session_id) ?? []
       const turns = messages.filter(message => message.kind === 'user')
-      const sessionCards = []
+      let sessionCards = []
       if (turns.length === 0) {
-        sessionCards.push(this.sessionCard(node, messages, tasks, null, undefined, positions, sizes, metricsByCard))
+        sessionCards.push(this.sessionCard(node, messages, tasks, null, undefined, positions, sizes, metricsByCard, completedTurns))
+        sessionCards = this.mergeCommandCards(node, sessionCards, commandsBySession.get(node.session_id) ?? [], positions, sizes)
         cards.push(...sessionCards)
         cardsBySession.set(node.session_id, sessionCards)
         lastCardBySession.set(node.session_id, `${node.session_id}:session`)
@@ -193,8 +224,9 @@ export class AtlasStore {
         const range = messages.filter(message => message.sourceSeq >= turn.sourceSeq && (next === undefined || message.sourceSeq < next.sourceSeq))
         const taskRange = tasks.filter(task => task.sourceSeq >= turn.sourceSeq && (next === undefined || task.sourceSeq < next.sourceSeq))
         const previous = index === 0 ? undefined : sessionCards.at(-1)?.id
-        sessionCards.push(this.sessionCard(node, range, taskRange, turn, previous, positions, sizes, metricsByCard))
+        sessionCards.push(this.sessionCard(node, range, taskRange, turn, previous, positions, sizes, metricsByCard, completedTurns))
       }
+      sessionCards = this.mergeCommandCards(node, sessionCards, commandsBySession.get(node.session_id) ?? [], positions, sizes)
       cards.push(...sessionCards)
       cardsBySession.set(node.session_id, sessionCards)
       lastCardBySession.set(node.session_id, `${node.session_id}:turn:${turns.at(-1).sourceSeq}`)
@@ -202,7 +234,10 @@ export class AtlasStore {
     for (const card of cards) {
       if (card.parentSessionId === null || card.parentCardId !== undefined) continue
       const parentCards = cardsBySession.get(card.parentSessionId) ?? []
-      const anchor = parentCards.filter(item => item.sourceSeq === null || card.seedLength === null || item.sourceSeq < card.seedLength).at(-1)
+      // Atlas command cards are display projections, not native DSH turns included
+      // in a fork's seed history. They may follow a turn visually, but must never
+      // replace that native turn as the parent of a forked session.
+      const anchor = parentCards.filter(item => item.command !== true && (item.sourceSeq === null || card.seedLength === null || item.sourceSeq < card.seedLength)).at(-1)
       card.parentCardId = anchor?.id ?? lastCardBySession.get(card.parentSessionId)
     }
     const hiddenCards = new Set(this.db.prepare('SELECT card_id FROM atlas_hidden_card').all().map(row => row.card_id))
@@ -213,7 +248,7 @@ export class AtlasStore {
     return { cards: cards.filter(card => !hiddenCards.has(card.id)), workspaces: this.workspaceSummaries(nodes.map(toNode)) }
   }
 
-  sessionCard(node, messages, tasks, turn, parentCardId, positions, sizes, metricsByCard) {
+  sessionCard(node, messages, tasks, turn, parentCardId, positions, sizes, metricsByCard, completedTurns) {
     const sourceSeq = turn?.sourceSeq ?? null
     const id = sourceSeq === null ? `${node.session_id}:session` : `${node.session_id}:turn:${sourceSeq}`
     const answer = [...messages].reverse().find(message => message.kind === 'assistant')
@@ -221,14 +256,77 @@ export class AtlasStore {
     const saved = positions.get(id)
     const savedSize = sizes.get(id)
     return {
-      id, sessionId: node.session_id, cwd: node.cwd, title: displayMessageText(turn?.text ?? node.title),
+      id, sessionId: node.session_id, cwd: node.cwd, sessionTitle: node.title, title: displayMessageText(turn?.text ?? node.title),
       summary: displayMessageText(answer?.text ?? (turn === undefined ? '等待这条会话的第一条消息。' : '等待回复…')),
       sourceSeq, branchSeq: answer?.sourceSeq ?? sourceSeq, parentSessionId: node.parent_session_id, seedLength: node.seed_length,
       parentCardId, position: saved === undefined ? null : { x: saved.x, y: saved.y }, size: savedSize === undefined ? null : { width: savedSize.width, height: savedSize.height },
       tools: process.length, todos: tasks.length, updatedAt: node.updated_at,
       metrics: sourceSeq === null ? null : metricsByCard.get(`${node.session_id}:${sourceSeq}`) ?? null,
+      settled: sourceSeq !== null && completedTurns.has(`${node.session_id}:${sourceSeq}`),
       messages, process, tasks,
     }
+  }
+
+  mergeCommandCards(node, sessionCards, commands, positions, sizes) {
+    const merged = [...sessionCards]
+    for (const command of commands) {
+      const card = this.commandCard(node, command, positions, sizes)
+      const nextIndex = merged.findIndex(item => item.sourceSeq !== null && item.sourceSeq > (command.anchor_source_seq ?? -1))
+      merged.splice(nextIndex === -1 ? merged.length : nextIndex, 0, card)
+    }
+    for (const [index, card] of merged.entries()) if (index > 0) card.parentCardId = merged[index - 1].id
+    return merged
+  }
+
+  commandCard(node, command, positions, sizes) {
+    const id = `${node.session_id}:command:${command.id}`
+    const status = command.status === 'running' || command.status === 'error' ? command.status : 'completed'
+    const summary = (command.result_text ? localizeCommandResult(command.line, command.result_text) : null) || (status === 'running'
+      ? 'DSH 正在执行这条命令，完成后会自动更新。'
+      : status === 'error' ? '命令执行失败，请查看提示后重试。' : `${command.line} 已由 DSH 执行；该命令没有生成模型回答。`)
+    const saved = positions.get(id)
+    const savedSize = sizes.get(id)
+    return {
+      id, sessionId: node.session_id, cwd: node.cwd, sessionTitle: node.title, title: command.line, summary,
+      sourceSeq: command.anchor_source_seq, branchSeq: command.anchor_source_seq,
+      parentSessionId: node.parent_session_id, seedLength: node.seed_length, parentCardId: undefined,
+      position: saved === undefined ? null : { x: saved.x, y: saved.y }, size: savedSize === undefined ? null : { width: savedSize.width, height: savedSize.height },
+      tools: 0, todos: 0, updatedAt: command.updated_at ?? command.created_at, metrics: null, command: true, commandStatus: status,
+      messages: [
+        { sourceSeq: command.anchor_source_seq ?? 0, kind: 'user', text: command.line, turn: null, step: null, process: [], at: command.created_at },
+        { sourceSeq: command.anchor_source_seq ?? 0, kind: 'system', text: summary, turn: null, step: null, process: [], at: command.created_at },
+      ],
+      process: [], tasks: [],
+    }
+  }
+
+  async recordCommandExecution(sessionId, execution) {
+    await this.ready
+    this.node(sessionId)
+    const line = typeof execution?.line === 'string' ? execution.line.trim() : ''
+    if (!/^\/[^\s]+(?:\s[\s\S]*)?$/.test(line) || line.length > 2_000) throw new AtlasInputError('DSH 命令格式无效')
+    const executionKey = typeof execution?.executionKey === 'string' && execution.executionKey.trim() !== '' ? execution.executionKey.trim().slice(0, 160) : null
+    const status = execution?.status === 'running' || execution?.status === 'error' ? execution.status : 'completed'
+    const resultText = typeof execution?.resultText === 'string' && execution.resultText.trim() !== '' ? localizeCommandResult(line, execution.resultText).slice(0, MAX_TEXT_LENGTH) : null
+    const anchor = this.db.prepare('SELECT MAX(source_seq) AS source_seq FROM atlas_message WHERE session_id = ?').get(sessionId)?.source_seq ?? null
+    const createdAt = now()
+    const inserted = this.db.prepare('INSERT INTO atlas_command_execution(session_id, execution_key, line, result_text, status, anchor_source_seq, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(sessionId, executionKey, line, resultText, status, anchor, createdAt, createdAt)
+    this.db.prepare('UPDATE atlas_node SET updated_at = ? WHERE session_id = ?').run(createdAt, sessionId)
+    return { id: `${sessionId}:command:${inserted.lastInsertRowid}`, executionKey, line, resultText, status, createdAt }
+  }
+
+  async updateCommandExecution(sessionId, executionKey, execution) {
+    await this.ready
+    if (typeof executionKey !== 'string' || executionKey.trim() === '') throw new AtlasInputError('命令执行标识无效')
+    const status = execution?.status === 'error' ? 'error' : 'completed'
+    const row = this.db.prepare('SELECT line FROM atlas_command_execution WHERE session_id = ? AND execution_key = ?').get(sessionId, executionKey)
+    if (row === undefined) throw new AtlasNotFoundError('命令执行记录不存在')
+    const resultText = typeof execution?.resultText === 'string' && execution.resultText.trim() !== '' ? localizeCommandResult(row.line, execution.resultText).slice(0, MAX_TEXT_LENGTH) : null
+    const updatedAt = now()
+    const changed = this.db.prepare('UPDATE atlas_command_execution SET result_text = ?, status = ?, updated_at = ? WHERE session_id = ? AND execution_key = ?').run(resultText, status, updatedAt, sessionId, executionKey).changes
+    if (changed === 0) throw new AtlasNotFoundError('命令执行记录不存在')
+    this.db.prepare('UPDATE atlas_node SET updated_at = ? WHERE session_id = ?').run(updatedAt, sessionId)
+    return { executionKey, resultText, status, updatedAt }
   }
 
   async setCardMarker(cardId, marker) {
@@ -294,6 +392,11 @@ export class AtlasStore {
     await this.ready
     const parsed = parseCardId(cardId)
     const node = this.node(parsed.sessionId)
+    if (parsed.commandId !== null) {
+      const command = this.db.prepare('SELECT id, session_id, line, result_text, anchor_source_seq, created_at FROM atlas_command_execution WHERE id = ? AND session_id = ?').get(parsed.commandId, parsed.sessionId)
+      if (command === undefined) throw new AtlasNotFoundError('命令卡片不存在')
+      return { node: toNode(node), messages: this.commandCard(node, command, new Map(), new Map()).messages }
+    }
     if (parsed.sourceSeq === null) return this.detail(parsed.sessionId)
     const next = this.db.prepare('SELECT source_seq FROM atlas_message WHERE session_id = ? AND kind = ? AND source_seq > ? ORDER BY source_seq LIMIT 1').get(parsed.sessionId, 'user', parsed.sourceSeq)
     const rows = next === undefined
@@ -471,6 +574,7 @@ export class AtlasStore {
       this.db.prepare('DELETE FROM atlas_task WHERE session_id = ?').run(session.id)
       this.db.prepare('DELETE FROM atlas_pending_tool WHERE session_id = ?').run(session.id)
       this.db.prepare('DELETE FROM atlas_llm_step WHERE session_id = ?').run(session.id)
+      this.db.prepare('DELETE FROM atlas_turn_completion WHERE session_id = ?').run(session.id)
       for (const event of events ?? []) if (event.seq >= replayFrom) this.projectEventInternal(session, event)
       this.db.exec('COMMIT')
     } catch (error) {
@@ -510,12 +614,23 @@ export class AtlasStore {
     }
     if (event.type === 'step/start' || event.type === 'assistant/chunk' || event.type === 'assistant/message') this.foldLlmEvent(sessionId, event)
     if (event.type === 'tool/call' || event.type === 'tool/result') return this.foldToolEvent(sessionId, event)
+    if (event.type === 'turn/end') this.completeTurn(sessionId, event)
     const projection = projectable(event)
     if (projection === null) return
     const insert = this.db.prepare('INSERT OR IGNORE INTO atlas_message(session_id, source_seq, kind, text, turn_number, step_number, process_json, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(sessionId, event.seq, projection.kind, projection.text, projection.turn, projection.step, projection.kind === 'assistant' ? '[]' : null, eventTime(event))
     if (projection.kind === 'assistant') this.attachPendingTools(sessionId, projection.turn, projection.step, event.seq)
     if (insert.changes > 0) this.db.prepare('UPDATE atlas_node SET updated_at = ?, title = CASE WHEN title = ? AND ? = ? THEN ? ELSE title END WHERE session_id = ?').run(eventTime(event), 'DSH 对话', projection.kind, 'user', titleFromText(displayMessageText(projection.text)), sessionId)
     if (event.type === 'todo/write') this.replaceTasks(sessionId, event)
+  }
+
+  completeTurn(sessionId, event) {
+    const card = this.db.prepare(`SELECT source_seq FROM atlas_message
+      WHERE session_id = ? AND kind = 'user' AND source_seq < ? ORDER BY source_seq DESC LIMIT 1`).get(sessionId, event.seq)
+    if (card === undefined) return
+    this.db.prepare(`INSERT INTO atlas_turn_completion(session_id, card_source_seq, completed_seq, completed_at)
+      VALUES (?, ?, ?, ?) ON CONFLICT(session_id, card_source_seq) DO UPDATE SET
+      completed_seq = MAX(completed_seq, excluded.completed_seq), completed_at = excluded.completed_at`)
+      .run(sessionId, card.source_seq, event.seq, eventTime(event))
   }
 
   foldLlmEvent(sessionId, event) {
@@ -556,17 +671,19 @@ export class AtlasStore {
     const process = JSON.parse(target.process_json ?? '[]')
     const entry = process.find(item => item.callId === callId)
     if (event.type === 'tool/call') {
-      if (entry === undefined) process.push({ callId, name: String(event.data?.name ?? '工具调用'), arguments: String(event.data?.arguments ?? ''), result: null, error: null })
+      if (entry === undefined) process.push({ callId, name: String(event.data?.name ?? '工具调用'), arguments: String(event.data?.arguments ?? ''), result: null, error: null, sourceSeq: event.seq })
       else {
         entry.name = String(event.data?.name ?? entry.name ?? '工具调用')
         entry.arguments = String(event.data?.arguments ?? entry.arguments ?? '')
+        entry.sourceSeq = Math.min(Number.isSafeInteger(entry.sourceSeq) ? entry.sourceSeq : event.seq, event.seq)
       }
     } else if (entry === undefined) {
-      process.push({ callId, name: '工具调用', arguments: null, result: contentText(event.data?.message?.content), meta: toolPresentationMeta(event.data?.message), error: event.data?.error ? `${event.data.error.name}: ${event.data.error.code}` : null })
+      process.push({ callId, name: '工具调用', arguments: null, result: contentText(event.data?.message?.content), meta: toolPresentationMeta(event.data?.message), error: event.data?.error ? `${event.data.error.name}: ${event.data.error.code}` : null, sourceSeq: event.seq, resultSeq: event.seq })
     } else {
       entry.result = contentText(event.data?.message?.content)
       entry.meta = toolPresentationMeta(event.data?.message) ?? entry.meta
       entry.error = event.data?.error ? `${event.data.error.name}: ${event.data.error.code}` : null
+      entry.resultSeq = event.seq
     }
     this.db.prepare('UPDATE atlas_message SET process_json = ? WHERE session_id = ? AND source_seq = ?').run(JSON.stringify(process), sessionId, target.source_seq)
     this.dedupeToolCall(sessionId, callId, target.source_seq)
@@ -574,14 +691,16 @@ export class AtlasStore {
 
   rememberPendingTool(sessionId, event, callId) {
     const row = this.db.prepare('SELECT payload_json FROM atlas_pending_tool WHERE session_id = ? AND call_id = ?').get(sessionId, callId)
-    const entry = row === undefined ? { callId, name: '工具调用', arguments: null, result: null, error: null } : JSON.parse(row.payload_json)
+    const entry = row === undefined ? { callId, name: '工具调用', arguments: null, result: null, error: null, sourceSeq: event.seq } : JSON.parse(row.payload_json)
     if (event.type === 'tool/call') {
       entry.name = String(event.data?.name ?? entry.name)
       entry.arguments = String(event.data?.arguments ?? '')
+      entry.sourceSeq = Math.min(Number.isSafeInteger(entry.sourceSeq) ? entry.sourceSeq : event.seq, event.seq)
     } else {
       entry.result = contentText(event.data?.message?.content)
       entry.meta = toolPresentationMeta(event.data?.message) ?? entry.meta
       entry.error = event.data?.error ? `${event.data.error.name}: ${event.data.error.code}` : null
+      entry.resultSeq = event.seq
     }
     this.db.prepare(`INSERT INTO atlas_pending_tool(session_id, call_id, turn_number, step_number, payload_json, updated_at)
       VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(session_id, call_id) DO UPDATE SET
@@ -609,10 +728,24 @@ export class AtlasStore {
   dedupeToolCall(sessionId, callId, keepSourceSeq) {
     const rows = this.db.prepare('SELECT source_seq, process_json FROM atlas_message WHERE session_id = ? AND kind = ? AND source_seq <> ? AND process_json IS NOT NULL').all(sessionId, 'assistant', keepSourceSeq)
     const update = this.db.prepare('UPDATE atlas_message SET process_json = ? WHERE session_id = ? AND source_seq = ?')
+    let earliestSourceSeq = null
     for (const row of rows) {
       const process = JSON.parse(row.process_json ?? '[]')
+      const duplicate = process.find(item => item.callId === callId)
+      if (duplicate && Number.isSafeInteger(duplicate.sourceSeq)) earliestSourceSeq = earliestSourceSeq === null ? duplicate.sourceSeq : Math.min(earliestSourceSeq, duplicate.sourceSeq)
       const filtered = process.filter(item => item.callId !== callId)
       if (filtered.length !== process.length) update.run(JSON.stringify(filtered), sessionId, row.source_seq)
+    }
+    if (earliestSourceSeq !== null) {
+      const keeper = this.db.prepare('SELECT process_json FROM atlas_message WHERE session_id = ? AND source_seq = ?').get(sessionId, keepSourceSeq)
+      if (keeper !== undefined) {
+        const process = JSON.parse(keeper.process_json ?? '[]')
+        const entry = process.find(item => item.callId === callId)
+        if (entry) {
+          entry.sourceSeq = Math.min(Number.isSafeInteger(entry.sourceSeq) ? entry.sourceSeq : earliestSourceSeq, earliestSourceSeq)
+          update.run(JSON.stringify(process), sessionId, keepSourceSeq)
+        }
+      }
     }
   }
 
@@ -719,9 +852,11 @@ function toolPresentationMeta(message) {
 }
 function parseCardId(cardId) {
   const turn = /^(.*):turn:(\d+)$/.exec(cardId)
-  if (turn !== null) return { sessionId: turn[1], sourceSeq: Number(turn[2]) }
+  if (turn !== null) return { sessionId: turn[1], sourceSeq: Number(turn[2]), commandId: null }
+  const command = /^(.*):command:(\d+)$/.exec(cardId)
+  if (command !== null) return { sessionId: command[1], sourceSeq: null, commandId: Number(command[2]) }
   const session = /^(.*):session$/.exec(cardId)
-  return { sessionId: session?.[1] ?? cardId, sourceSeq: null }
+  return { sessionId: session?.[1] ?? cardId, sourceSeq: null, commandId: null }
 }
 function runtimeContext(text) { return text.trimStart().startsWith('Current runtime context. This snapshot supersedes earlier runtime-context snapshots.') }
 function sessionCwd(session) { const cwd = session?.header?.meta?.cwd ?? session?.header?.cwd; return typeof cwd === 'string' && cwd.trim() !== '' ? cwd : '未指定工作目录' }

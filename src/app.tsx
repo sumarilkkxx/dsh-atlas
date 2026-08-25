@@ -1,24 +1,26 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Archive, AtSign, Bot, Check, ChevronDown, ChevronLeft, ChevronRight, CircleMinus, CirclePlus, Command, FileText, Focus, GitBranch, ListTodo, LoaderCircle, MessageSquareText, Minus, Moon, MoreHorizontal, Paperclip, Plus, Search, Send, Shield, Sun, Trash2, Wrench, X } from 'lucide-react'
+import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Archive, AtSign, Bot, Check, ChevronDown, ChevronLeft, ChevronRight, CircleMinus, CirclePlus, Command, FileText, Focus, FolderOpen, GitBranch, ListFilter, ListTodo, LoaderCircle, MessageSquareText, Minus, Moon, MoreHorizontal, PanelLeftClose, PanelLeftOpen, Paperclip, Plus, Search, Send, Shield, Sun, Trash2, Wrench, X } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { Badge } from './components/ui/badge'
 import { Button } from './components/ui/button'
 import { Dialog, DialogContent, DialogTitle } from './components/ui/dialog'
-import { cardSize, DEFAULT_CARD_SIZE, draftCardPosition, draftConnector, graphView as buildGraphView, latestCardIds, layoutConversationGraph, revealConversationPath } from './lib/conversation-graph'
+import { cardHasSettledReply, cardSize, DEFAULT_CARD_SIZE, draftCardPosition, draftConnector, findPendingProjection, graphView as buildGraphView, latestCardIds, layoutConversationGraph, liveTextForCard, revealConversationPath } from './lib/conversation-graph'
+import { commandClaimForInput, completedCommandLookup, localizeCommandDescriptor } from './lib/command-copy'
 
 type Point = { x: number; y: number }
 type CardSize = { width: number; height: number }
-type Process = { callId: string; name: string; arguments?: string | null; result: string | null; meta?: Record<string, unknown> | null; error?: string | null }
+type Process = { callId: string; name: string; arguments?: string | null; result: string | null; meta?: Record<string, unknown> | null; error?: string | null; sourceSeq?: number; resultSeq?: number }
 type Message = { sourceSeq: number; kind: string; text: string; process: Process[]; at?: string }
 type Task = { id: string; sessionId: string; sourceSeq: number; content: string; status: string; updatedAt?: string }
 type MarkerKind = 'none' | 'conclusion' | 'verify' | 'ruleout' | 'decision' | 'pivot' | 'open'
 type Marker = { important: boolean; kind: MarkerKind; updatedAt?: string | null }
 type CardMetrics = { llmMs?: number; ttftAverageMs?: number; tokensPerSecond?: number; cacheHitPercent?: number; inputTokens?: number; outputTokens?: number }
-type Card = { id: string; sessionId: string; cwd: string; title: string; summary: string; sourceSeq: number | null; branchSeq?: number | null; parentCardId?: string; parentSessionId: string | null; position: Point | null; size?: CardSize | null; tools: number; todos: number; metrics?: CardMetrics | null; messages: Message[]; tasks: Task[]; marker: Marker }
+type Card = { id: string; sessionId: string; cwd: string; sessionTitle?: string; title: string; summary: string; sourceSeq: number | null; branchSeq?: number | null; parentCardId?: string; parentSessionId: string | null; position: Point | null; size?: CardSize | null; tools: number; todos: number; metrics?: CardMetrics | null; messages: Message[]; tasks: Task[]; marker: Marker; settled?: boolean; command?: boolean; commandStatus?: 'running' | 'completed' | 'error' }
 type Workspace = { id?: string; cwd: string; title: string; sessionCount: number }
 type DshWorkspace = { id: string; title: string; path: string | null; sessionIds: string[] }
-type Compose = { kind: 'new' } | { kind: 'continue' | 'branch'; card: Card }
+type ComposeSubmission = { id: string; phase: 'submitting' | 'accepted'; text: string; sessionId?: string; baselineCardIds: string[]; point: Point }
+type Compose = ({ kind: 'new' } | { kind: 'continue' | 'branch'; card: Card }) & { submission?: ComposeSubmission }
 type RpcPending = { resolve: (value: unknown) => void; reject: (reason: Error) => void; timer: number }
 type ThemeOverride = 'light' | 'dark' | null
 type SessionNode = { id: string; card: Card; parentId: string | null; children: SessionNode[] }
@@ -39,6 +41,7 @@ type DeleteState = { card: Card; mode: DeleteMode; successorId?: string }
 type UndoNotice = { operationId: string; count: number; title: string }
 type ResizeEdge = { left: boolean; right: boolean; top: boolean; bottom: boolean }
 type ConversationSummary = { rootSessionId: string; revision: string; text: string; provider?: string | null; model?: string | null; generatedAt?: string }
+type LiveActivity = { kind: 'thinking' | 'tool' | 'reply'; status: 'running' | 'completed'; label: string }
 type Filter = 'all' | 'tools' | 'todos' | 'attachments' | 'marked' | MarkerKind
 
 const demoCards: Card[] = [
@@ -51,6 +54,10 @@ const readCollapsed = () => { try { const value = JSON.parse(localStorage.getIte
 const readCamera = () => { try { const value = JSON.parse(localStorage.getItem('dsh-atlas:camera:v3') ?? '{}'); return { scale: finite(value.scale, 1), offset: { x: finite(value.x, 0), y: finite(value.y, 0) } } } catch { return { scale: 1, offset: { x: 0, y: 0 } } } }
 const readThemeOverride = (): ThemeOverride => { const value = localStorage.getItem('dsh-atlas:theme:v1'); return value === 'light' || value === 'dark' ? value : null }
 const readSidebarCollapsed = () => { try { return localStorage.getItem('dsh-atlas:sidebar-collapsed:v1') === 'true' } catch { return false } }
+const SIDEBAR_MIN_WIDTH = 188
+const SIDEBAR_MAX_WIDTH = 320
+const clampSidebarWidth = (value: number) => Math.max(SIDEBAR_MIN_WIDTH, Math.min(SIDEBAR_MAX_WIDTH, Math.min(value, Math.max(SIDEBAR_MIN_WIDTH, window.innerWidth - 640))))
+const readSidebarWidth = () => { try { const value = Number(localStorage.getItem('dsh-atlas:sidebar-width:v1')); return Number.isFinite(value) ? clampSidebarWidth(value) : 244 } catch { return 244 } }
 const FILTER_OPTIONS: { id: Filter; label: string }[] = [{ id: 'all', label: '全部' }, { id: 'tools', label: '工具' }, { id: 'todos', label: '待办' }, { id: 'attachments', label: '附件' }, { id: 'marked', label: '重点' }, { id: 'conclusion', label: '结论' }, { id: 'verify', label: '待验证' }]
 
 export function App() {
@@ -71,7 +78,9 @@ export function App() {
   const [collapsed, setCollapsed] = useState<Set<string>>(readCollapsed)
   const [detail, setDetail] = useState<Card | null>(null)
   const [compose, setCompose] = useState<Compose | null>(null)
+  const [pendingNewCanvasSession, setPendingNewCanvasSession] = useState<string | null>(null)
   const [live, setLive] = useState<Record<string, string>>({})
+  const [liveActivity, setLiveActivity] = useState<Record<string, LiveActivity>>({})
   const [draft, setDraft] = useState('')
   const [busy, setBusy] = useState(false)
   const [loading, setLoading] = useState(!isDevPreview)
@@ -80,6 +89,8 @@ export function App() {
   const [hostDark, setHostDark] = useState(false)
   const [themeOverride, setThemeOverride] = useState<ThemeOverride>(readThemeOverride)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(readSidebarCollapsed)
+  const [sidebarWidth, setSidebarWidth] = useState(readSidebarWidth)
+  const [sidebarCompactPanel, setSidebarCompactPanel] = useState<'search' | 'filter' | 'workspace' | 'sessions' | null>(null)
   const [openCardMenuId, setOpenCardMenuId] = useState<string | null>(null)
   const [nativeModel, setNativeModel] = useState('使用当前 DSH 模型')
   const [sidebarDeleteMode, setSidebarDeleteMode] = useState(false)
@@ -105,11 +116,14 @@ export function App() {
   const cardsRef = useRef(cards)
   const activeSessionRef = useRef(activeSession)
   const nativeSessionRef = useRef('')
+  const canvasSessionLockRef = useRef<string | 'creating' | null>(null)
   const loadVersion = useRef(0)
   const loadAbort = useRef<AbortController | null>(null)
   const hasLoaded = useRef(isDevPreview)
   const undoTimer = useRef<number | null>(null)
+  const sidebarResize = useRef<{ x: number; width: number } | null>(null)
   const summaryRequest = useRef(0)
+  const newConversationCamera = useRef<{ scale: number; offset: Point } | null>(null)
   cardsRef.current = cards
   activeSessionRef.current = activeSession
 
@@ -161,6 +175,8 @@ export function App() {
         const id = data.session?.id ?? ''
         if (id === nativeSessionRef.current) return
         nativeSessionRef.current = id
+        const lockedSession = canvasSessionLockRef.current
+        if (lockedSession === 'creating' || (lockedSession !== null && id !== lockedSession)) return
         setActiveSession(id)
         if (id) setCanvasRootSession(id)
         setDetail(value => value && value.sessionId !== id ? null : value)
@@ -176,7 +192,11 @@ export function App() {
       if (data.type === 'atlas:refresh') void load()
       if (data.type === 'atlas:theme') setHostDark(data.dark === true)
       if (data.type === 'atlas:native-state' && typeof data.model === 'string') setNativeModel(data.model.replace(/^选择模型，当前\s*/, ''))
-      if (data.type === 'atlas:live-reply' && typeof data.sessionId === 'string') setLive(value => data.running ? { ...value, [data.sessionId]: String(data.text ?? '') } : without(value, data.sessionId))
+      if (data.type === 'atlas:live-reply' && typeof data.sessionId === 'string') {
+        setLive(value => data.running ? { ...value, [data.sessionId]: String(data.text ?? '') } : without(value, data.sessionId))
+        const activity = normalizeLiveActivity(data.activity)
+        setLiveActivity(value => data.running && activity ? { ...value, [data.sessionId]: activity } : without(value, data.sessionId))
+      }
       if (data.type === 'atlas:error') { if (!settle(data.requestId, null, String(data.message ?? '操作未完成'))) setError(String(data.message ?? '操作未完成')) }
       if (['atlas:created-session', 'atlas:forked-session'].includes(data.type)) settle(data.requestId, data.session)
       if (data.type === 'atlas:message-sent') settle(data.requestId, { sessionId: data.sessionId })
@@ -186,7 +206,8 @@ export function App() {
       if (data.type === 'atlas:skill-directory') settle(data.requestId, Array.isArray(data.skills) ? data.skills : [])
       if (data.type === 'atlas:permission-directory') settle(data.requestId, data.permissions)
       if (data.type === 'atlas:permission-selected') settle(data.requestId, data.permissions)
-      if (data.type === 'atlas:command-ran') settle(data.requestId, data.result)
+      if (data.type === 'atlas:command-accepted') settle(data.requestId, data.result)
+      if (data.type === 'atlas:command-finished') { void load(); if (data.status === 'error' && typeof data.message === 'string') setError(data.message) }
       if (data.type === 'atlas:map-opened') { setDetail(null); setDraft(''); setSummaryRefreshVersion(value => value + 1); window.setTimeout(() => focusRef.current(), 0) }
     }
     window.addEventListener('message', receive); post('atlas:ready')
@@ -203,16 +224,24 @@ export function App() {
   useEffect(() => { setZoomText(String(Math.round(scale * 100))) }, [scale])
   useEffect(() => { try { if (themeOverride) localStorage.setItem('dsh-atlas:theme:v1', themeOverride); else localStorage.removeItem('dsh-atlas:theme:v1') } catch { /* storage can be disabled */ } }, [themeOverride])
   useEffect(() => { try { localStorage.setItem('dsh-atlas:sidebar-collapsed:v1', String(sidebarCollapsed)) } catch { /* storage can be disabled */ } }, [sidebarCollapsed])
+  useEffect(() => { try { localStorage.setItem('dsh-atlas:sidebar-width:v1', String(sidebarWidth)) } catch { /* storage can be disabled */ } }, [sidebarWidth])
   const selectedDshWorkspace = dshWorkspaces.find(item => item.id === selectedDshWorkspaceId)
   const workspaceCards = useMemo(() => selectedDshWorkspace === undefined
     ? cards.filter(card => !cwd || card.cwd === cwd)
     : cards.filter(card => selectedDshWorkspace.sessionIds.includes(card.sessionId)), [cards, cwd, selectedDshWorkspace])
+  const isNewConversationCanvas = compose?.kind === 'new' || pendingNewCanvasSession !== null
+  useEffect(() => {
+    if (pendingNewCanvasSession && workspaceCards.some(card => card.sessionId === pendingNewCanvasSession)) setPendingNewCanvasSession(null)
+  }, [pendingNewCanvasSession, workspaceCards])
   const sessionTree = useMemo(() => buildSessionTree(workspaceCards), [workspaceCards])
   const resolvedCanvasRoot = useMemo(() => {
+    // Keep the newly-created session as the canvas authority while its first
+    // projected card is still catching up with the native session stream.
+    if (pendingNewCanvasSession) return pendingNewCanvasSession
     if (workspaceCards.some(card => card.sessionId === canvasRootSession)) return rootSessionId(workspaceCards, canvasRootSession)
     if (workspaceCards.some(card => card.sessionId === activeSession)) return rootSessionId(workspaceCards, activeSession)
     return sessionTree[0]?.id ?? ''
-  }, [activeSession, canvasRootSession, sessionTree, workspaceCards])
+  }, [activeSession, canvasRootSession, pendingNewCanvasSession, sessionTree, workspaceCards])
   const canvasCards = useMemo(() => conversationCards(workspaceCards, resolvedCanvasRoot), [resolvedCanvasRoot, workspaceCards])
   const positions = useMemo(() => layoutConversationGraph(canvasCards) as Map<string, Point>, [canvasCards])
   const graph = useMemo(() => buildGraphView(canvasCards, collapsed) as { cards: Card[]; childCounts: Map<string, number> }, [canvasCards, collapsed])
@@ -226,7 +255,7 @@ export function App() {
   const sidebarSessionNodes = useMemo(() => flattenSessionNodes(sidebarTree), [sidebarTree])
   const selectedSidebarNodes = useMemo(() => sidebarSessionNodes.filter(node => selectedSessionIds.has(node.id)), [selectedSessionIds, sidebarSessionNodes])
   const allSidebarSelected = sidebarSessionNodes.length > 0 && selectedSidebarNodes.length === sidebarSessionNodes.length
-  const canvasTasks = useMemo(() => canvasCards.flatMap(card => card.tasks.map(task => ({ task, card }))).sort((a, b) => a.task.status.localeCompare(b.task.status) || a.card.title.localeCompare(b.card.title)), [canvasCards])
+  const canvasTasks = useMemo(() => isNewConversationCanvas ? [] : canvasCards.flatMap(card => card.tasks.map(task => ({ task, card }))).sort((a, b) => a.task.status.localeCompare(b.task.status) || a.card.title.localeCompare(b.card.title)), [canvasCards, isNewConversationCanvas])
   const deletePlan = useMemo(() => deletion ? planDeletion(canvasCards, deletion.card.id) : null, [canvasCards, deletion])
   const deletePreviewIds = useMemo(() => new Set(deletion?.mode === 'subtree' ? deletePlan?.descendants.map(card => card.id) ?? [] : deletion ? [deletion.card.id] : []), [deletePlan, deletion])
   const reconnectPreview = useMemo(() => {
@@ -239,6 +268,9 @@ export function App() {
   useEffect(() => { document.documentElement.classList.toggle('atlas-dark', dark); return () => document.documentElement.classList.remove('atlas-dark') }, [dark])
   const fallbackBrief = useMemo(() => conversationBrief(canvasCards), [canvasCards])
   const historyBrief = conversationSummary?.rootSessionId === resolvedCanvasRoot ? conversationSummary.text : fallbackBrief
+  const visibleHistoryBrief = isNewConversationCanvas
+    ? pendingNewCanvasSession ? '正在建立新的会话画布…' : '输入第一条消息后，将创建一张独立的会话画布。'
+    : historyBrief
   useEffect(() => {
     if (isDevPreview || !resolvedCanvasRoot || canvasCards.length === 0) return
     const revision = conversationRevision(canvasCards)
@@ -267,8 +299,38 @@ export function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [resolvedCanvasRoot, summaryRefreshVersion])
   const composeAnchor = compose?.kind === 'new' ? undefined : compose?.card
-  const composePoint = useMemo(() => compose ? draftCardPosition(graph.cards, positions, composeAnchor) as Point | null : null, [compose, composeAnchor, graph.cards, positions])
+  const composePoint = useMemo(() => compose ? compose.submission?.point ?? (compose.kind === 'new' ? { x: 70, y: 90 } : draftCardPosition(graph.cards, positions, composeAnchor) as Point | null) : null, [compose, composeAnchor, graph.cards, positions])
+  const composeProjection = useMemo(() => compose?.submission ? findPendingProjection(cards, compose.submission) as Card | undefined : undefined, [cards, compose])
+  const composeProjectionSettled = composeProjection ? cardHasSettledReply(composeProjection) : false
+  useEffect(() => {
+    if (!compose?.submission || !composeProjection || !composeProjectionSettled) return
+    const submissionId = compose.submission.id
+    const point = compose.submission.point
+    setCards(value => value.map(card => card.id === composeProjection.id
+      ? { ...card, position: point }
+      : card))
+    if (!composeProjection.position || composeProjection.position.x !== point.x || composeProjection.position.y !== point.y) void savePosition(composeProjection.id, point)
+    setCompose(value => value?.submission?.id === submissionId ? null : value)
+    setDraft('')
+    if (compose.kind === 'new') newConversationCamera.current = null
+  }, [compose, composeProjection, composeProjectionSettled])
+  const renderedGraphCards = useMemo(() => composeProjection ? graph.cards.filter(card => card.id !== composeProjection.id) : graph.cards, [composeProjection, graph.cards])
   const branchCount = new Set(canvasCards.filter(card => card.sessionId !== resolvedCanvasRoot).map(card => card.sessionId)).size
+  const visibleCardCount = isNewConversationCanvas ? compose?.kind === 'new' ? 1 : 0 : graph.cards.length
+  const visibleBranchCount = isNewConversationCanvas ? 0 : branchCount
+  const detailSettled = detail ? cardHasSettledReply(detail) : false
+  const detailLive = detail && !detailSettled ? liveTextForCard(detail, continuableCardIds, live) : undefined
+  const rawDetailActivity = detail && !detailSettled && continuableCardIds.has(detail.id) ? liveActivity[detail.sessionId] : undefined
+  const detailActivity = rawDetailActivity && shouldShowLiveActivity(detail, rawDetailActivity) ? rawDetailActivity : undefined
+  useEffect(() => {
+    setDetail(current => {
+      if (!current) return current
+      const projected = cards.find(card => card.id === current.id)
+      if (!projected) return current
+      const messages = projected.messages.length > 0 ? projected.messages : current.messages
+      return { ...current, ...projected, messages }
+    })
+  }, [cards])
   useEffect(() => {
     if (!resolvedCanvasRoot) return
     setCanvasRootSession(value => value === resolvedCanvasRoot ? value : resolvedCanvasRoot)
@@ -368,12 +430,20 @@ export function App() {
     } catch (reason) { setError(reason instanceof Error ? reason.message : '保存标记失败，请重试') }
   }
   function selectSession(card: Card) {
+    canvasSessionLockRef.current = null
+    setCompose(null); setDraft(''); setPendingNewCanvasSession(null); newConversationCamera.current = null
     setCanvasRootSession(rootSessionId(workspaceCards, card.sessionId)); setActiveSession(card.sessionId); setDetail(null)
     setSummaryRefreshVersion(value => value + 1)
     setCollapsed(value => revealConversationPath(cards, card.sessionId, value))
     post('atlas:activate-session', { sessionId: card.sessionId })
     window.setTimeout(() => focusRef.current(), 0)
   }
+  function selectDshWorkspace(id: string) {
+    canvasSessionLockRef.current = null
+    const workspace = dshWorkspaces.find(item => item.id === id)
+    setSelectedDshWorkspaceId(id); setCwd(workspace?.path ?? ''); setDetail(null); setCanvasRootSession('')
+  }
+  function selectWorkspace(path: string) { canvasSessionLockRef.current = null; setCwd(path); setDetail(null); setCanvasRootSession('') }
   function exitSidebarDeleteMode() { setSidebarDeleteMode(false); setSelectedSessionIds(new Set()); setSidebarDeleteConfirm(false) }
   function toggleSidebarSelection(id: string) {
     setSelectedSessionIds(value => {
@@ -405,6 +475,71 @@ export function App() {
     for (const [id, point] of next) void savePosition(id, point)
   }
   function toggleTheme() { setThemeOverride(dark ? 'light' : 'dark') }
+  function beginNewConversation() {
+    canvasSessionLockRef.current = 'creating'
+    if (compose?.kind !== 'new') newConversationCamera.current = { scale, offset }
+    setCompose({ kind: 'new' }); setDraft(''); setPendingNewCanvasSession(null); setDetail(null); setOpenCardMenuId(null); setSidebarCompactPanel(null)
+    setScale(1); setOffset({ x: 0, y: 0 })
+  }
+  function cancelCompose() {
+    if (busy) return
+    if (compose?.kind === 'new' && newConversationCamera.current) {
+      setScale(newConversationCamera.current.scale); setOffset(newConversationCamera.current.offset)
+    }
+    canvasSessionLockRef.current = null; newConversationCamera.current = null; setCompose(null); setDraft('')
+  }
+  function focusSearch() {
+    if (window.matchMedia('(max-width: 900px)').matches) {
+      const input = document.querySelector<HTMLInputElement>('.atlas-search-mobile input'); input?.focus(); input?.select(); return
+    }
+    if (sidebarCollapsed) {
+      setSidebarCompactPanel('search')
+      window.setTimeout(() => { const input = document.querySelector<HTMLInputElement>('.atlas-sidebar-compact-search input'); input?.focus(); input?.select() }, 0)
+      return
+    }
+    const input = document.querySelector<HTMLInputElement>('.atlas-search-sidebar input'); input?.focus(); input?.select()
+  }
+  function handleAppShortcut(event: React.KeyboardEvent<HTMLElement>) {
+    const target = event.target as HTMLElement
+    const editable = target.matches('input, textarea, select, [contenteditable="true"]')
+    const dialogOpen = document.querySelector('[role="dialog"]') !== null
+    if (!dialogOpen && (event.ctrlKey || event.metaKey) && event.key.toLocaleLowerCase() === 'k') {
+      event.preventDefault(); focusSearch(); return
+    }
+    if (!dialogOpen && !editable && event.key === '/') {
+      event.preventDefault(); focusSearch(); return
+    }
+    if (!dialogOpen && !editable && event.key === 'Escape') {
+      if (openCardMenuId !== null) { setOpenCardMenuId(null); return }
+      if (sidebarCompactPanel !== null) { setSidebarCompactPanel(null); return }
+      if (compose !== null) cancelCompose()
+    }
+  }
+  function handleSearchKeyDown(event: React.KeyboardEvent<HTMLInputElement>) {
+    if (event.key !== 'Escape') return
+    event.preventDefault()
+    if (query) setQuery(''); else { event.currentTarget.blur(); setSidebarCompactPanel(null) }
+  }
+  function beginSidebarResize(event: React.PointerEvent<HTMLDivElement>) {
+    if (sidebarCollapsed || event.button !== 0) return
+    event.preventDefault(); event.stopPropagation()
+    sidebarResize.current = { x: event.clientX, width: sidebarWidth }
+    event.currentTarget.setPointerCapture(event.pointerId)
+    const move = (pointer: PointerEvent) => {
+      const start = sidebarResize.current
+      if (!start) return
+      setSidebarWidth(clampSidebarWidth(start.width + pointer.clientX - start.x))
+    }
+    const finish = () => {
+      sidebarResize.current = null
+      document.removeEventListener('pointermove', move)
+      document.removeEventListener('pointerup', finish)
+      document.removeEventListener('pointercancel', finish)
+    }
+    document.addEventListener('pointermove', move)
+    document.addEventListener('pointerup', finish)
+    document.addEventListener('pointercancel', finish)
+  }
   function requestDelete(card: Card) { const plan = planDeletion(canvasCards, card.id); setDeletion({ card, mode: 'single', successorId: plan.mainSuccessor?.id ?? plan.directChildren[0]?.id }) }
   function requestArchive(card: Card) { setArchiveCard(card) }
   async function confirmArchive() {
@@ -446,19 +581,40 @@ export function App() {
   function commitZoom(value = zoomText) { const percent = Number(value.replace('%', '').trim()); if (!Number.isFinite(percent)) return setZoomText(String(Math.round(scale * 100))); zoomAt(percent / 100); setZoomText(String(Math.round(Math.max(50, Math.min(400, percent))))) }
   async function submitCompose(value = draft) {
     const text = value.trim(); if (!compose || text === '' || busy) return
+    const current = compose
+    const submission: ComposeSubmission = {
+      id: crypto.randomUUID(),
+      phase: 'submitting',
+      text,
+      baselineCardIds: cardsRef.current.map(card => card.id),
+      point: composePoint ?? { x: 70, y: 90 },
+    }
+    setCompose({ ...current, submission }); setDraft('')
     setBusy(true); setError('')
     try {
-      if (compose.kind === 'new') {
+      let sessionId: string
+      if (current.kind === 'new') {
         const session = await rpc('atlas:create-session', { workspaceId: selectedDshWorkspace?.id, cwd: cwd || undefined }) as { id: string }
-        await rpc('atlas:send-message', { sessionId: session.id, text }); setActiveSession(session.id)
-      } else if (compose.kind === 'continue') {
-        await rpc('atlas:send-message', { sessionId: compose.card.sessionId, text }); setActiveSession(compose.card.sessionId)
+        sessionId = session.id
+        canvasSessionLockRef.current = session.id
+        setPendingNewCanvasSession(session.id); setCanvasRootSession(session.id); setActiveSession(session.id)
+      } else if (current.kind === 'continue') {
+        sessionId = current.card.sessionId
+        setActiveSession(sessionId)
       } else {
-        const session = await rpc('atlas:fork-session', { sessionId: compose.card.sessionId, atSeq: compose.card.branchSeq ?? compose.card.sourceSeq ?? undefined }) as { id: string }
-        await rpc('atlas:send-message', { sessionId: session.id, text }); setActiveSession(session.id)
+        const session = await rpc('atlas:fork-session', { sessionId: current.card.sessionId, atSeq: current.card.branchSeq ?? current.card.sourceSeq ?? undefined }) as { id: string }
+        sessionId = session.id
+        setActiveSession(sessionId)
       }
-      setCompose(null); setDraft(''); window.setTimeout(() => void load(), 180)
-    } catch (reason) { setError(reason instanceof Error ? reason.message : '操作未完成') }
+      setCompose(value => value?.submission?.id === submission.id ? { ...value, submission: { ...value.submission, sessionId } } : value)
+      await rpc('atlas:send-message', { sessionId, text })
+      setCompose(value => value?.submission?.id === submission.id ? { ...value, submission: { ...value.submission, phase: 'accepted', sessionId } } : value)
+      void load()
+    } catch (reason) {
+      setCompose(value => value?.submission?.id === submission.id ? current : value)
+      setDraft(text)
+      setError(reason instanceof Error ? reason.message : '操作未完成')
+    }
     finally { setBusy(false) }
   }
   async function continueConversation(sessionId: string, text: string) {
@@ -471,34 +627,85 @@ export function App() {
   }
   async function runCommand(sessionId: string, line: string) {
     if (busy) return null
-    setBusy(true); setError('')
-    try { const result = await rpc('atlas:run-command', { sessionId, line }); setDraft(''); window.setTimeout(() => void load(), 180); return result }
+    setBusy(true); setError(''); setActiveSession(sessionId)
+    setCanvasRootSession(rootSessionId(workspaceCards, sessionId)); setCollapsed(value => revealConversationPath(cards, sessionId, value))
+    try {
+      const result = await rpc('atlas:run-command', { sessionId, line })
+      setDraft(''); setCompose(value => value?.kind !== 'new' && value?.card.sessionId === sessionId ? null : value); window.setTimeout(() => void load(), 180); return result
+    }
     catch (reason) { setError(reason instanceof Error ? reason.message : '命令执行失败'); return null }
     finally { setBusy(false) }
   }
+  async function runComposeCommand(line: string) {
+    if (!compose || compose.kind === 'new') return null
+    if (compose.kind !== 'branch') return runCommand(compose.card.sessionId, line)
+    if (busy) return null
+    const source = compose.card
+    setBusy(true); setError('')
+    try {
+      const session = await rpc('atlas:fork-session', { sessionId: source.sessionId, atSeq: source.branchSeq ?? source.sourceSeq ?? undefined }) as { id: string }
+      const result = await rpc('atlas:run-command', { sessionId: session.id, line })
+      setActiveSession(session.id); setCanvasRootSession(rootSessionId(workspaceCards, source.sessionId)); setCompose(null); setDraft('')
+      window.setTimeout(() => void load(), 180)
+      return result
+    } catch (reason) { setError(reason instanceof Error ? reason.message : '命令执行失败'); return null }
+    finally { setBusy(false) }
+  }
 
-  return <main className={`atlas-shell ${dark ? 'atlas-dark' : ''}`} onPointerDownCapture={event => {
+  return <main className={`atlas-shell ${dark ? 'atlas-dark' : ''}`} onKeyDown={handleAppShortcut} onPointerDownCapture={event => {
     if (!(event.target as HTMLElement).closest('.atlas-card-menu-wrap')) setOpenCardMenuId(null)
+    if (!(event.target as HTMLElement).closest('.atlas-sidebar-compact-item')) setSidebarCompactPanel(null)
   }}>
-    <header className="atlas-topbar"><div className="atlas-brand"><span className="atlas-mark">A</span><span>DSH Atlas</span></div><div className="atlas-search atlas-search-mobile"><Search className="size-4" /><input value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索标题、对话、工具与待办" aria-label="搜索会话历史" /></div><div className="atlas-topbar-actions"><button className="atlas-theme-switch" type="button" role="switch" aria-checked={dark} onClick={toggleTheme} aria-label="切换深色或浅色主题" title={dark ? '切换为浅色主题' : '切换为深色主题'}><Sun className="atlas-theme-sun size-3.5" /><Moon className="atlas-theme-moon size-3.5" /><span className="atlas-theme-knob" /></button></div></header>
-    <div className={`atlas-layout ${sidebarCollapsed ? 'is-sidebar-collapsed' : ''}`}><aside className="atlas-sidebar"><button type="button" className="atlas-sidebar-toggle" onClick={() => setSidebarCollapsed(value => !value)} aria-label={sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'} title={sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'}><ChevronLeft className="size-4" /></button><button type="button" className="atlas-new-session" onClick={() => { setCompose({ kind: 'new' }); setDraft('') }}><Plus className="size-3.5" /><span>新会话</span></button><div className="atlas-search atlas-search-sidebar"><Search className="size-4" /><input value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索标题、对话、工具与待办" aria-label="搜索会话历史" /></div><div className="atlas-filter-row" role="group" aria-label="筛选画布卡片">{FILTER_OPTIONS.map(item => <button key={item.id} type="button" className={filter === item.id ? 'is-active' : ''} onClick={() => setFilter(item.id)}>{item.label}</button>)}</div><div className="atlas-section-title"><span>工作目录</span></div>{dshWorkspaces.length > 0 ? <select className="atlas-workspace-select" value={selectedDshWorkspaceId} onChange={event => { const workspace = dshWorkspaces.find(item => item.id === event.target.value); setSelectedDshWorkspaceId(event.target.value); setCwd(workspace?.path ?? ''); setDetail(null); setCanvasRootSession('') }}>{dshWorkspaces.map(item => <option key={item.id} value={item.id}>{item.title} · {item.sessionIds.length}</option>)}</select> : <select className="atlas-workspace-select" value={cwd} onChange={event => { setCwd(event.target.value); setDetail(null); setCanvasRootSession('') }}>{workspaces.map(item => <option key={item.cwd} value={item.cwd}>{item.title} · {item.sessionCount}</option>)}</select>}<div className="atlas-section-title atlas-session-heading"><span>{searchActive ? '搜索到的会话' : '会话'}</span><div className="atlas-session-heading-actions">{sidebarDeleteMode ? <><button type="button" className="atlas-select-all" onClick={toggleAllSidebarSelections}>{allSidebarSelected ? '取消全选' : '全选'}</button><span>{selectedSidebarNodes.length}/{sidebarSessionCount}</span><button type="button" className="atlas-session-delete-trigger" onClick={exitSidebarDeleteMode} aria-label="取消批量删除" title="取消"><X className="size-3.5" /></button><button type="button" className="atlas-session-delete-trigger is-danger" disabled={selectedSidebarNodes.length === 0} onClick={() => setSidebarDeleteConfirm(true)} aria-label="删除已选会话" title="删除已选"><Trash2 className="size-3.5" /></button></> : <><span>{sidebarSessionCount}</span><button type="button" className="atlas-session-delete-trigger" onClick={() => { setSidebarDeleteMode(true); setSelectedSessionIds(new Set()) }} aria-label="批量删除会话" title="批量删除会话"><Trash2 className="size-3.5" /></button></>}</div></div><nav className="atlas-nav" aria-label={searchActive ? '搜索到的会话历史' : '会话与分支'}>{sidebarTree.map(node => <SessionNav key={node.id} node={node} activeSession={activeSession} canvasRoot={resolvedCanvasRoot} expanded={expandedSessions} onToggle={id => setExpandedSessions(value => { const next = new Set(value); if (next.has(id)) next.delete(id); else next.add(id); return next })} onSelect={selectSession} selectionMode={sidebarDeleteMode} selectedSessionIds={selectedSessionIds} onSelectForDelete={toggleSidebarSelection} />)}{searchActive && sidebarTree.length === 0 && <p className="atlas-nav-empty">没有匹配的会话历史</p>}</nav>{canvasTasks.length > 0 && <section className="atlas-task-list" aria-label="当前画布待办"><div className="atlas-section-title"><span>待办</span><span>{canvasTasks.length}</span></div>{canvasTasks.slice(0, 8).map(({ task, card }) => <button type="button" key={task.id} onClick={() => void open(card)} title={`定位到「${card.title}」`}><ListTodo className="size-3.5" /><span>{task.content}</span><em>{task.status}</em></button>)}</section>}</aside>
-      <section className="atlas-stage-wrap"><div className="atlas-stage-header"><div className="atlas-conversation-brief" tabIndex={0}><span>AI 摘要</span><p title={historyBrief}>{historyBrief}</p><div className="atlas-brief-popover" role="tooltip">{historyBrief}</div><small>{summaryRefreshing ? '正在根据会话历史更新摘要 · ' : ''}{refreshing && <span className="atlas-refresh-status"><LoaderCircle className="size-3 animate-spin" />后台同步中</span>}{searchActive ? `${matchingCards.length} / ${graph.cards.length} 张命中` : `${graph.cards.length} 张可见卡片`} · {branchCount} 个分支 · 可续问、折叠与移动</small></div><div className="atlas-stage-actions"><Button className="atlas-arrange-button" variant="outline" size="sm" onClick={arrange}>整理节点</Button><Button className="atlas-mobile-new" size="sm" onClick={() => { setCompose({ kind: 'new' }); setDraft('') }}><Plus className="size-3.5" />新建</Button><Button variant="outline" size="sm" onClick={focusActive}><Focus className="size-3.5" />定位</Button><div className="atlas-zoom"><button onClick={() => zoomAt(scale - .1)} aria-label="缩小"><Minus className="size-3.5" /></button><input value={zoomText} inputMode="numeric" aria-label="画布缩放百分比" onChange={event => setZoomText(event.target.value.replace(/[^0-9.]/g, ''))} onBlur={() => commitZoom()} onKeyDown={event => { if (event.key === 'Enter') { event.currentTarget.blur(); commitZoom(event.currentTarget.value) } }} /><span>%</span><button onClick={() => zoomAt(scale + .1)} aria-label="放大"><Plus className="size-3.5" /></button></div></div></div>
+    <header className="atlas-topbar"><div className="atlas-brand"><span className="atlas-mark">A</span><span>DSH Atlas</span></div><div className="atlas-search atlas-search-mobile"><Search className="size-4" /><input value={query} onChange={event => setQuery(event.target.value)} onKeyDown={handleSearchKeyDown} placeholder="搜索标题、对话、工具与待办" aria-label="搜索会话历史" /></div><div className="atlas-topbar-actions"><button className="atlas-theme-switch" type="button" role="switch" aria-checked={dark} onClick={toggleTheme} aria-label="切换深色或浅色主题" title={dark ? '切换为浅色主题' : '切换为深色主题'}><Sun className="atlas-theme-sun size-3.5" /><Moon className="atlas-theme-moon size-3.5" /><span className="atlas-theme-knob" /></button></div></header>
+    <div className={`atlas-layout ${sidebarCollapsed ? 'is-sidebar-collapsed' : ''}`} style={{ '--atlas-sidebar-width': `${sidebarWidth}px` } as CSSProperties}>
+      <aside className="atlas-sidebar">
+        <button type="button" className="atlas-sidebar-toggle" onClick={() => { setSidebarCollapsed(value => !value); setSidebarCompactPanel(null) }} aria-label={sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'} title={sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'}>{sidebarCollapsed ? <PanelLeftOpen className="size-[18px]" /> : <PanelLeftClose className="size-[18px]" />}</button>
+        <div className="atlas-sidebar-shortcuts">
+          <button type="button" className="atlas-new-session" onClick={beginNewConversation} aria-label="新会话" title="新会话"><Plus className="size-3.5" /><span>新会话</span></button>
+          <div className="atlas-sidebar-compact-item">
+            <button type="button" className="atlas-sidebar-compact-action" onClick={() => setSidebarCompactPanel(value => value === 'search' ? null : 'search')} aria-expanded={sidebarCompactPanel === 'search'} aria-haspopup="dialog" aria-label="搜索会话" title="搜索"><Search className="size-4" /></button>
+            {sidebarCompactPanel === 'search' && <div className="atlas-sidebar-compact-menu atlas-sidebar-compact-search" role="dialog" aria-label="搜索会话"><div className="atlas-compact-menu-title">搜索会话</div><div className="atlas-search"><Search className="size-4" /><input autoFocus value={query} onChange={event => setQuery(event.target.value)} onKeyDown={handleSearchKeyDown} placeholder="搜索标题、对话、工具与待办" aria-label="搜索会话历史" /></div></div>}
+          </div>
+          <div className="atlas-sidebar-compact-item">
+            <button type="button" className="atlas-sidebar-compact-action" onClick={() => setSidebarCompactPanel(value => value === 'filter' ? null : 'filter')} aria-expanded={sidebarCompactPanel === 'filter'} aria-haspopup="menu" aria-label="筛选画布卡片" title="筛选"><ListFilter className="size-4" /></button>
+            {sidebarCompactPanel === 'filter' && <div className="atlas-sidebar-compact-menu atlas-sidebar-filter-menu" role="menu" aria-label="筛选画布卡片">{FILTER_OPTIONS.map(item => <button key={item.id} type="button" role="menuitemradio" aria-checked={filter === item.id} className={filter === item.id ? 'is-active' : ''} onClick={() => { setFilter(item.id); setSidebarCompactPanel(null) }}>{item.label}</button>)}</div>}
+          </div>
+          <div className="atlas-sidebar-compact-item">
+            <button type="button" className="atlas-sidebar-compact-action" onClick={() => setSidebarCompactPanel(value => value === 'workspace' ? null : 'workspace')} aria-expanded={sidebarCompactPanel === 'workspace'} aria-haspopup="menu" aria-label="选择工作目录" title="工作目录"><FolderOpen className="size-4" /></button>
+            {sidebarCompactPanel === 'workspace' && <div className="atlas-sidebar-compact-menu atlas-sidebar-workspace-menu" role="menu" aria-label="选择工作目录"><div className="atlas-compact-menu-title">工作目录</div>{dshWorkspaces.length > 0 ? dshWorkspaces.map(item => <button key={item.id} type="button" role="menuitemradio" aria-checked={item.id === selectedDshWorkspaceId} className={item.id === selectedDshWorkspaceId ? 'is-active' : ''} onClick={() => { selectDshWorkspace(item.id); setSidebarCompactPanel(null) }}><FolderOpen className="size-3.5" /><span>{item.title}</span><small>{item.sessionIds.length}</small></button>) : workspaces.map(item => <button key={item.cwd} type="button" role="menuitemradio" aria-checked={item.cwd === cwd} className={item.cwd === cwd ? 'is-active' : ''} onClick={() => { selectWorkspace(item.cwd); setSidebarCompactPanel(null) }}><FolderOpen className="size-3.5" /><span>{item.title}</span><small>{item.sessionCount}</small></button>)}</div>}
+          </div>
+          <div className="atlas-sidebar-compact-item">
+            <button type="button" className="atlas-sidebar-compact-action" onClick={() => setSidebarCompactPanel(value => value === 'sessions' ? null : 'sessions')} aria-expanded={sidebarCompactPanel === 'sessions'} aria-haspopup="dialog" aria-label="浏览会话" title="会话"><MessageSquareText className="size-4" /></button>
+            {sidebarCompactPanel === 'sessions' && <div className="atlas-sidebar-compact-menu atlas-sidebar-sessions-menu" role="dialog" aria-label="浏览会话"><div className="atlas-compact-menu-title"><span>{searchActive ? '搜索到的会话' : '会话'}</span><small>{sidebarSessionCount}</small></div><nav className="atlas-nav" aria-label="紧凑会话列表">{sidebarTree.map(node => <SessionNav key={node.id} node={node} activeSession={activeSession} canvasRoot={resolvedCanvasRoot} expanded={expandedSessions} onToggle={id => setExpandedSessions(value => { const next = new Set(value); if (next.has(id)) next.delete(id); else next.add(id); return next })} onSelect={card => { selectSession(card); setSidebarCompactPanel(null) }} selectionMode={false} selectedSessionIds={selectedSessionIds} onSelectForDelete={() => {}} />)}{sidebarTree.length === 0 && <p className="atlas-nav-empty">没有匹配的会话历史</p>}</nav></div>}
+          </div>
+        </div>
+        <div className="atlas-sidebar-content">
+          <div className="atlas-search atlas-search-sidebar"><Search className="size-4" /><input value={query} onChange={event => setQuery(event.target.value)} onKeyDown={handleSearchKeyDown} placeholder="搜索标题、对话、工具与待办" aria-label="搜索会话历史" /></div>
+          <div className="atlas-filter-row" role="group" aria-label="筛选画布卡片">{FILTER_OPTIONS.map(item => <button key={item.id} type="button" className={filter === item.id ? 'is-active' : ''} onClick={() => setFilter(item.id)}>{item.label}</button>)}</div>
+          <div className="atlas-section-title"><span>工作目录</span></div>{dshWorkspaces.length > 0 ? <select className="atlas-workspace-select" value={selectedDshWorkspaceId} onChange={event => selectDshWorkspace(event.target.value)}>{dshWorkspaces.map(item => <option key={item.id} value={item.id}>{item.title} · {item.sessionIds.length}</option>)}</select> : <select className="atlas-workspace-select" value={cwd} onChange={event => selectWorkspace(event.target.value)}>{workspaces.map(item => <option key={item.cwd} value={item.cwd}>{item.title} · {item.sessionCount}</option>)}</select>}
+          <div className="atlas-section-title atlas-session-heading"><span>{searchActive ? '搜索到的会话' : '会话'}</span><div className="atlas-session-heading-actions">{sidebarDeleteMode ? <><button type="button" className="atlas-select-all" onClick={toggleAllSidebarSelections}>{allSidebarSelected ? '取消全选' : '全选'}</button><span>{selectedSidebarNodes.length}/{sidebarSessionCount}</span><button type="button" className="atlas-session-delete-trigger" onClick={exitSidebarDeleteMode} aria-label="取消批量删除" title="取消"><X className="size-3.5" /></button><button type="button" className="atlas-session-delete-trigger is-danger" disabled={selectedSidebarNodes.length === 0} onClick={() => setSidebarDeleteConfirm(true)} aria-label="删除已选会话" title="删除已选"><Trash2 className="size-3.5" /></button></> : <><span>{sidebarSessionCount}</span><button type="button" className="atlas-session-delete-trigger" onClick={() => { setSidebarDeleteMode(true); setSelectedSessionIds(new Set()) }} aria-label="批量删除会话" title="批量删除会话"><Trash2 className="size-3.5" /></button></>}</div></div>
+          <nav className="atlas-nav" aria-label={searchActive ? '搜索到的会话历史' : '会话与分支'}>{sidebarTree.map(node => <SessionNav key={node.id} node={node} activeSession={activeSession} canvasRoot={resolvedCanvasRoot} expanded={expandedSessions} onToggle={id => setExpandedSessions(value => { const next = new Set(value); if (next.has(id)) next.delete(id); else next.add(id); return next })} onSelect={selectSession} selectionMode={sidebarDeleteMode} selectedSessionIds={selectedSessionIds} onSelectForDelete={toggleSidebarSelection} />)}{searchActive && sidebarTree.length === 0 && <p className="atlas-nav-empty">没有匹配的会话历史</p>}</nav>
+          {canvasTasks.length > 0 && <section className="atlas-task-list" aria-label="当前画布待办"><div className="atlas-section-title"><span>待办</span><span>{canvasTasks.length}</span></div>{canvasTasks.slice(0, 8).map(({ task, card }) => <button type="button" key={task.id} onClick={() => void open(card)} title={`定位到「${card.title}」`}><ListTodo className="size-3.5" /><span>{task.content}</span><em>{task.status}</em></button>)}</section>}
+        </div>
+        {!sidebarCollapsed && <div className="atlas-sidebar-resizer" role="separator" aria-orientation="vertical" aria-label="调整侧边栏宽度" aria-valuemin={SIDEBAR_MIN_WIDTH} aria-valuemax={SIDEBAR_MAX_WIDTH} aria-valuenow={Math.round(sidebarWidth)} tabIndex={0} onPointerDown={beginSidebarResize} onKeyDown={event => { if (event.key === 'ArrowLeft') { event.preventDefault(); setSidebarWidth(value => clampSidebarWidth(value - 16)) } if (event.key === 'ArrowRight') { event.preventDefault(); setSidebarWidth(value => clampSidebarWidth(value + 16)) } }} />}
+      </aside>
+      <section className="atlas-stage-wrap"><div className="atlas-stage-header"><div className="atlas-conversation-brief" tabIndex={0}><span>AI 摘要</span><p title={visibleHistoryBrief}>{visibleHistoryBrief}</p><div className="atlas-brief-popover" role="tooltip">{visibleHistoryBrief}</div><small>{!isNewConversationCanvas && summaryRefreshing ? '正在根据会话历史更新摘要 · ' : ''}{refreshing && <span className="atlas-refresh-status"><LoaderCircle className="size-3 animate-spin" />后台同步中</span>}{!isNewConversationCanvas && searchActive ? `${matchingCards.length} / ${visibleCardCount} 张命中` : `${visibleCardCount} 张可见卡片`} · {visibleBranchCount} 个分支 · {isNewConversationCanvas ? '发送后写入会话历史' : '可续问、折叠与移动'}</small></div><div className="atlas-stage-actions"><Button className="atlas-arrange-button" variant="outline" size="sm" onClick={arrange} disabled={isNewConversationCanvas}>整理节点</Button><Button className="atlas-mobile-new" size="sm" onClick={beginNewConversation}><Plus className="size-3.5" />新建</Button><Button variant="outline" size="sm" onClick={focusActive} disabled={isNewConversationCanvas}><Focus className="size-3.5" />定位</Button><div className="atlas-zoom"><button onClick={() => zoomAt(scale - .1)} aria-label="缩小"><Minus className="size-3.5" /></button><input value={zoomText} inputMode="numeric" aria-label="画布缩放百分比" onChange={event => setZoomText(event.target.value.replace(/[^0-9.]/g, ''))} onBlur={() => commitZoom()} onKeyDown={event => { if (event.key === 'Enter') { event.currentTarget.blur(); commitZoom(event.currentTarget.value) } }} /><span>%</span><button onClick={() => zoomAt(scale + .1)} aria-label="放大"><Plus className="size-3.5" /></button></div></div></div>
         {error && <div className="atlas-error" role="alert"><span>{error}</span><button onClick={() => setError('')}>关闭</button></div>}
         <div ref={stage} className="atlas-stage" onDragStart={event => event.preventDefault()} onPointerDown={event => { if (!(event.target as HTMLElement).closest('[data-card]')) { event.preventDefault(); window.getSelection()?.removeAllRanges(); pan.current = { x: event.clientX, y: event.clientY, offset }; event.currentTarget.setPointerCapture(event.pointerId) } }} onPointerMove={move} onPointerUp={stop} onPointerCancel={stop} onWheel={event => { if ((event.target as HTMLElement).closest('[data-card]')) return; event.preventDefault(); zoomAt(scale + (event.deltaY < 0 ? .08 : -.08), event.clientX, event.clientY) }}>
-          <div className="atlas-grid" />{loading && workspaceCards.length === 0 && <div className="atlas-empty"><LoaderCircle className="size-5 animate-spin" />正在同步 DSH 对话…</div>}{!loading && workspaceCards.length === 0 && <div className="atlas-empty"><MessageSquareText className="size-6" /><strong>当前工作区还没有可整理的对话</strong><span>在 DSH 中开始一次对话，Atlas 会自动生成卡片。</span></div>}
+          <div className="atlas-grid" />{pendingNewCanvasSession && <div className="atlas-empty"><LoaderCircle className="size-5 animate-spin" />正在建立新的会话画布…</div>}{!isNewConversationCanvas && loading && workspaceCards.length === 0 && <div className="atlas-empty"><LoaderCircle className="size-5 animate-spin" />正在同步 DSH 对话…</div>}{!isNewConversationCanvas && !loading && workspaceCards.length === 0 && <div className="atlas-empty"><MessageSquareText className="size-6" /><strong>当前工作区还没有可整理的对话</strong><span>在 DSH 中开始一次对话，Atlas 会自动生成卡片。</span></div>}
           <div className="atlas-world" style={{ transform: `translate(${offset.x}px, ${offset.y}px) scale(${scale})` }}>
             <svg className="atlas-connections" width="3600" height="2400" aria-hidden="true">
-              {graph.cards.map(card => { const parent = card.parentCardId && canvasCards.find(item => item.id === card.parentCardId); const from = parent && positions.get(parent.id); const to = positions.get(card.id)!; const preview = deletePreviewIds.has(card.id) || (card.parentCardId ? deletePreviewIds.has(card.parentCardId) : false); const matched = searchActive && (matchingIds.has(card.id) || Boolean(card.parentCardId && matchingIds.has(card.parentCardId))); return from && parent ? <path key={card.id} d={connectorPath(from, to, card.parentSessionId !== null, cardSize(parent), cardSize(card))} className={`${card.parentSessionId ? 'atlas-connection is-branch' : 'atlas-connection'} ${preview ? 'is-delete-preview' : ''} ${matched ? 'is-search-match' : ''}`} /> : null })}
-              {reconnectPreview.map(({ fromId, child }) => { const parent = canvasCards.find(card => card.id === fromId); const from = positions.get(fromId); const to = positions.get(child.id); return from && to && parent ? <path key={`preview:${child.id}`} d={connectorPath(from, to, child.parentSessionId !== null, cardSize(parent), cardSize(child))} className="atlas-connection is-reconnect-preview" /> : null })}
+              {!isNewConversationCanvas && renderedGraphCards.map(card => { const parent = card.parentCardId && canvasCards.find(item => item.id === card.parentCardId); const from = parent && positions.get(parent.id); const to = positions.get(card.id)!; const preview = deletePreviewIds.has(card.id) || (card.parentCardId ? deletePreviewIds.has(card.parentCardId) : false); const matched = searchActive && (matchingIds.has(card.id) || Boolean(card.parentCardId && matchingIds.has(card.parentCardId))); return from && parent ? <path key={card.id} d={connectorPath(from, to, card.parentSessionId !== null, cardSize(parent), cardSize(card))} className={`${card.parentSessionId ? 'atlas-connection is-branch' : 'atlas-connection'} ${preview ? 'is-delete-preview' : ''} ${matched ? 'is-search-match' : ''}`} /> : null })}
+              {!isNewConversationCanvas && reconnectPreview.map(({ fromId, child }) => { const parent = canvasCards.find(card => card.id === fromId); const from = positions.get(fromId); const to = positions.get(child.id); return from && to && parent ? <path key={`preview:${child.id}`} d={connectorPath(from, to, child.parentSessionId !== null, cardSize(parent), cardSize(child))} className="atlas-connection is-reconnect-preview" /> : null })}
               {composeAnchor && composePoint && positions.get(composeAnchor.id) && <path d={draftConnector(positions.get(composeAnchor.id)!, composePoint, cardSize(composeAnchor), DEFAULT_CARD_SIZE)} className="atlas-connection is-draft" />}
             </svg>
-              {graph.cards.map(card => <CardView key={card.id} card={card} point={positions.get(card.id)!} active={card.sessionId === activeSession} deleting={deletePreviewIds.has(card.id)} matched={searchActive && matchingIds.has(card.id)} live={live[card.sessionId]} childCount={graph.childCounts.get(card.id) ?? 0} collapsed={collapsed.has(card.id)} canContinue={continuableCardIds.has(card.id)} menuOpen={openCardMenuId === card.id} onMenuOpenChange={open => setOpenCardMenuId(open ? card.id : null)} draft={draft} setDraft={setDraft} busy={busy} fallbackModel={nativeModel} rpc={rpc} contextCards={canvasCards} onOpen={() => void open(card)} onDrag={event => beginDrag(event, card)} onResize={(event, edge) => beginResize(event, card, edge)} onContinue={() => { setCompose({ kind: 'continue', card }); setDraft('') }} onBranch={() => { setCompose({ kind: 'branch', card }); setDraft('') }} onSend={text => continueConversation(card.sessionId, text)} onCommand={line => runCommand(card.sessionId, line)} onOpenDsh={() => post('atlas:open-session', { sessionId: card.sessionId })} onArchive={() => requestArchive(card)} onDelete={() => requestDelete(card)} onMarker={marker => void saveMarker(card, marker)} onToggle={() => toggleChildren(card.id)} />)}
-            {compose && composePoint && <DraftCardView compose={compose} point={composePoint} draft={draft} setDraft={setDraft} busy={busy} fallbackModel={nativeModel} rpc={rpc} contextCards={canvasCards} onCancel={() => { if (!busy) { setCompose(null); setDraft('') } }} onSubmit={text => submitCompose(text)} onCommand={line => compose.kind === 'new' ? Promise.resolve(null) : runCommand(compose.card.sessionId, line)} />}
+              {!isNewConversationCanvas && renderedGraphCards.map(card => { const settled = cardHasSettledReply(card); return <CardView key={card.id} card={card} point={positions.get(card.id)!} active={card.sessionId === activeSession} deleting={deletePreviewIds.has(card.id)} matched={searchActive && matchingIds.has(card.id)} live={settled ? undefined : liveTextForCard(card, continuableCardIds, live)} activity={!settled && continuableCardIds.has(card.id) ? liveActivity[card.sessionId] : undefined} childCount={graph.childCounts.get(card.id) ?? 0} collapsed={collapsed.has(card.id)} canContinue={continuableCardIds.has(card.id)} menuOpen={openCardMenuId === card.id} onMenuOpenChange={open => setOpenCardMenuId(open ? card.id : null)} draft={draft} setDraft={setDraft} busy={busy} fallbackModel={nativeModel} rpc={rpc} contextCards={canvasCards} onOpen={() => void open(card)} onDrag={event => beginDrag(event, card)} onResize={(event, edge) => beginResize(event, card, edge)} onContinue={() => { setCompose({ kind: 'continue', card }); setDraft('') }} onBranch={() => { setCompose({ kind: 'branch', card }); setDraft('') }} onSend={text => continueConversation(card.sessionId, text)} onCommand={line => runCommand(card.sessionId, line)} onOpenDsh={() => post('atlas:open-session', { sessionId: card.sessionId })} onArchive={() => requestArchive(card)} onDelete={() => requestDelete(card)} onMarker={marker => void saveMarker(card, marker)} onToggle={() => toggleChildren(card.id)} /> })}
+            {compose && composePoint && <DraftCardView compose={compose} point={composePoint} projected={composeProjection} live={compose.submission?.sessionId ? live[compose.submission.sessionId] : undefined} activity={compose.submission?.sessionId ? liveActivity[compose.submission.sessionId] : undefined} draft={draft} setDraft={setDraft} busy={busy} fallbackModel={nativeModel} rpc={rpc} contextCards={canvasCards} onCancel={cancelCompose} onSubmit={text => submitCompose(text)} onCommand={runComposeCommand} />}
           </div>
         </div>
       </section>
     </div>
-    <Dialog open={detail !== null} onOpenChange={value => { if (!value) { setDetail(null); setDraft('') } }}><DialogContent className="atlas-detail-dialog"><div className="atlas-detail-content">{detail && <><header className="atlas-detail-header"><div className="flex gap-2"><Badge>{detail.parentSessionId ? '分支' : '会话'}</Badge><Badge>{detail.tools} 次工具</Badge></div><DialogTitle className="atlas-detail-title">对话详情</DialogTitle><p className="atlas-detail-subtitle" title={detail.title}>{previewText(detail.title)}</p></header><div className="atlas-detail-messages">{detail.messages.length ? detail.messages.map(message => <MessageView key={`${message.sourceSeq}:${message.kind}`} message={message} dark={dark} />) : <MarkdownText text={live[detail.sessionId] || detail.summary} />}{live[detail.sessionId] && <div className="atlas-detail-message is-assistant is-live"><span>DSH · 回复中</span><MarkdownText text={live[detail.sessionId]} /></div>}</div><footer className="atlas-detail-actions"><Button variant="outline" onClick={() => { setDetail(null); setCompose({ kind: 'branch', card: detail }); setDraft('') }}><GitBranch className="size-3.5" />从此回答分支</Button><Button variant="outline" onClick={() => post('atlas:open-session', { sessionId: detail.sessionId })}>在 DSH 中打开</Button></footer></>}</div></DialogContent></Dialog>
+    <Dialog open={detail !== null} onOpenChange={value => { if (!value) { setDetail(null); setDraft('') } }}><DialogContent className="atlas-detail-dialog"><div className="atlas-detail-content">{detail && <><header className="atlas-detail-header"><div className="flex gap-2"><Badge>{detail.parentSessionId ? '分支' : '会话'}</Badge><Badge>{detail.tools} 次工具</Badge></div><DialogTitle className="atlas-detail-title">对话详情</DialogTitle><p className="atlas-detail-subtitle" title={detail.title}>{previewText(detail.title)}</p></header><div className="atlas-detail-messages">{detail.messages.length ? detail.messages.map(message => <MessageView key={`${message.sourceSeq}:${message.kind}`} message={message} dark={dark} />) : <MarkdownText text={detail.summary} />}{(detailLive || detailActivity) && <div className="atlas-detail-message is-assistant is-live"><LiveActivityLine activity={detailActivity ?? { kind: 'reply', status: 'running', label: '正在生成回答' }} prefix="DSH" />{isLiveArtifactActivity(detailActivity) && <div className="atlas-live-artifact-placeholder"><LoaderCircle className="size-4 animate-spin" /><span>正在生成并同步可视化内容</span></div>}{detailLive && <MarkdownText text={detailLive} />}</div>}</div><footer className="atlas-detail-actions"><Button variant="outline" onClick={() => { setDetail(null); setCompose({ kind: 'branch', card: detail }); setDraft('') }}><GitBranch className="size-3.5" />从此回答分支</Button><Button variant="outline" onClick={() => post('atlas:open-session', { sessionId: detail.sessionId })}>在 DSH 中打开</Button></footer></>}</div></DialogContent></Dialog>
     <Dialog open={deletion !== null} onOpenChange={value => { if (!value && !deleting) setDeletion(null) }}><DialogContent className="atlas-delete-dialog"><div className="pr-7">{deletion && deletePlan && <><div className="atlas-delete-icon"><Trash2 className="size-5" /></div><DialogTitle className="mt-3 text-xl text-[var(--fg-2)]">删除卡片节点</DialogTitle><p className="atlas-delete-intro">操作只影响 Atlas 画布，DSH 原始对话会保留。</p><div className="atlas-delete-options" role="radiogroup" aria-label="删除范围"><button type="button" role="radio" aria-checked={deletion.mode === 'single'} className={deletion.mode === 'single' ? 'is-selected' : ''} onClick={() => setDeletion(value => value ? { ...value, mode: 'single' } : value)}><span className="atlas-delete-radio" /><span><strong>仅删除当前节点</strong><small>{deletePlan.directChildren.length > 0 ? `后续 ${deletePlan.directChildren.length} 个直接节点将自动接到上一个节点` : '删除这一张卡片，不影响其它节点'}</small></span></button>{deletePlan.descendants.length > 1 && <button type="button" role="radio" aria-checked={deletion.mode === 'subtree'} className={deletion.mode === 'subtree' ? 'is-selected is-danger' : ''} onClick={() => setDeletion(value => value ? { ...value, mode: 'subtree' } : value)}><span className="atlas-delete-radio" /><span><strong>删除此节点及所有后续</strong><small>共 {deletePlan.descendants.length} 张卡片{deletePlan.branchCount > 0 ? `、${deletePlan.branchCount} 个分支` : ''}，主线和分支后续都会删除</small></span></button>}</div>{deletion.mode === 'single' && !deletePlan.target.parentCardId && !deletePlan.mainSuccessor && deletePlan.directChildren.length > 1 && <label className="atlas-successor-field"><span>选择新的起始节点</span><select value={deletion.successorId ?? ''} onChange={event => setDeletion(value => value ? { ...value, successorId: event.target.value } : value)}>{deletePlan.directChildren.map(card => <option key={card.id} value={card.id}>{card.title}</option>)}</select><small>其它直接分支会自动连接到这个节点。</small></label>}<div className="atlas-delete-actions"><Button variant="outline" disabled={deleting} onClick={() => setDeletion(null)}>取消</Button><Button className="atlas-danger-button" disabled={deleting} onClick={() => void confirmDelete()}>{deleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}{deletion.mode === 'subtree' ? `删除 ${deletePlan.descendants.length} 张卡片` : '删除当前节点'}</Button></div></>}</div></DialogContent></Dialog>
     <Dialog open={sidebarDeleteConfirm} onOpenChange={value => { if (!value && !sidebarDeleting) setSidebarDeleteConfirm(false) }}><DialogContent className="atlas-delete-dialog"><div className="pr-7"><div className="atlas-delete-icon"><Trash2 className="size-5" /></div><DialogTitle className="mt-3 text-xl text-[var(--fg-2)]">移除 {selectedSidebarNodes.length} 条会话记录</DialogTitle><p className="atlas-delete-intro">将所选会话从 Atlas 侧栏与画布视图移除；DSH 中的原始对话和消息不会被删除。</p><div className="atlas-delete-actions"><Button variant="outline" disabled={sidebarDeleting} onClick={() => setSidebarDeleteConfirm(false)}>取消</Button><Button className="atlas-danger-button" disabled={sidebarDeleting} onClick={() => void confirmSidebarDelete()}>{sidebarDeleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}确认移除</Button></div></div></DialogContent></Dialog>
     <Dialog open={archiveCard !== null} onOpenChange={value => { if (!value && !archiving) setArchiveCard(null) }}><DialogContent className="atlas-delete-dialog"><div className="pr-7">{archiveCard && <><div className="atlas-delete-icon"><Archive className="size-5" /></div><DialogTitle className="mt-3 text-xl text-[var(--fg-2)]">归档当前会话</DialogTitle><p className="atlas-delete-intro">“{archiveCard.title}”及其后续分支将从 Atlas 画布隐藏，但不会删除 DSH 中的原始对话。</p><div className="atlas-delete-actions"><Button variant="outline" disabled={archiving} onClick={() => setArchiveCard(null)}>取消</Button><Button disabled={archiving} onClick={() => void confirmArchive()}>{archiving ? <LoaderCircle className="size-4 animate-spin" /> : <Archive className="size-4" />}归档会话</Button></div></>}</div></DialogContent></Dialog>
@@ -506,12 +713,13 @@ export function App() {
   </main>
 }
 
-function NativeComposer({ sessionId, draft, setDraft, busy, fallbackModel, rpc, contextCards, sourceCard, onSend, onCommand }: { sessionId: string; draft: string; setDraft: (value: string | ((previous: string) => string)) => void; busy: boolean; fallbackModel: string; rpc: (type: string, body?: object) => Promise<unknown>; contextCards: Card[]; sourceCard: Card; onSend: (text: string) => Promise<void>; onCommand: (line: string) => Promise<unknown> }) {
+function NativeComposer({ sessionId, draft, setDraft, busy, fallbackModel, rpc, contextCards, sourceCard, onSend, onCommand, onCancel }: { sessionId: string; draft: string; setDraft: (value: string | ((previous: string) => string)) => void; busy: boolean; fallbackModel: string; rpc: (type: string, body?: object) => Promise<unknown>; contextCards: Card[]; sourceCard: Card; onSend: (text: string) => Promise<void>; onCommand: (line: string) => Promise<unknown>; onCancel?: () => void }) {
   const [directory, setDirectory] = useState<ModelDirectory | null>(null)
   const [permissions, setPermissions] = useState<PermissionDirectory | null>(null)
   const [commands, setCommands] = useState<CommandDescriptor[]>([])
+  const [selectedCommand, setSelectedCommand] = useState<CommandDescriptor | null>(null)
   const [skills, setSkills] = useState<SkillDescriptor[]>([])
-  const [menu, setMenu] = useState<'model' | 'models' | 'effort' | 'permission' | 'command' | 'mention' | 'history' | 'skills' | null>(null)
+  const [menu, setMenu] = useState<'model' | 'models' | 'effort' | 'permission' | 'command' | 'mention' | 'history' | 'skills' | 'closed' | null>(null)
   const [modelBusy, setModelBusy] = useState(false)
   const [permissionBusy, setPermissionBusy] = useState(false)
   const [modelError, setModelError] = useState('')
@@ -546,15 +754,15 @@ function NativeComposer({ sessionId, draft, setDraft, busy, fallbackModel, rpc, 
     catch (reason) { setPermissionError(reason instanceof Error ? reason.message : '权限范围加载失败') }
     finally { setPermissionBusy(false) }
   }, [rpc, sessionId])
-  useEffect(() => { setMenu(null); setContextItems([]); void Promise.all([loadModels(), loadCommands(), loadSkills(), loadPermissions()]) }, [loadCommands, loadModels, loadPermissions, loadSkills])
+  useEffect(() => { setMenu(null); setSelectedCommand(null); setContextItems([]); void Promise.all([loadModels(), loadCommands(), loadSkills(), loadPermissions()]) }, [loadCommands, loadModels, loadPermissions, loadSkills])
   useEffect(() => {
-    if (menu === null) return
+    if (menu === null || menu === 'closed') return
     const close = (event: PointerEvent) => {
       const target = event.target as Element | null
       if (target && (popup.current?.contains(target) || target.closest('[data-composer-trigger]'))) return
-      setMenu(null)
+      setMenu('closed')
     }
-    const escape = (event: KeyboardEvent) => { if (event.key === 'Escape') setMenu(null) }
+    const escape = (event: KeyboardEvent) => { if (event.key === 'Escape') setMenu('closed') }
     document.addEventListener('pointerdown', close, true)
     document.addEventListener('keydown', escape)
     return () => { document.removeEventListener('pointerdown', close, true); document.removeEventListener('keydown', escape) }
@@ -600,21 +808,28 @@ function NativeComposer({ sessionId, draft, setDraft, busy, fallbackModel, rpc, 
   }
   const submit = async () => {
     const text = draft.trim()
-    if (busy || (text === '' && contextItems.length === 0)) return
+    if (busy || (text === '' && contextItems.length === 0 && selectedCommand === null)) return
     if (text === '/model') { setMenu('model'); return }
-    if (text.startsWith('/')) {
-      const result = await onCommand(text) as { status?: { running?: boolean; model?: string; effort?: string }; result?: { text?: string } } | null
-      if (result?.status) setNotice(`会话${result.status.running ? '正在运行' : '空闲'} · ${result.status.model ?? modelLabel}${result.status.effort ? ` · ${result.status.effort}` : ''}`)
-      else if (result?.result?.text) setNotice(result.result.text)
-      else if (result) setNotice(`${text.split(/\s/, 1)[0]} 已提交给 DSH`)
+    const attached = contextItems.map(serializeContextItem).join('')
+    const commandText = selectedCommand ? `/${selectedCommand.name}${text || attached ? ` ${`${text}${attached}`.trim()}` : ''}` : text.startsWith('/') ? `${text}${attached}`.trim() : ''
+    if (commandText) {
+      setMenu('closed')
+      const result = await onCommand(commandText) as { execution?: { sessionId: string; line: string }; status?: { running?: boolean; model?: string; effort?: string }; result?: { text?: string } } | null
+      if (!result) return
+      setSelectedCommand(null)
+      setContextItems([])
+      if (result.result?.text) setNotice(result.result.text)
+      else if (result.status?.running) setNotice(`${commandText.split(/\s/, 1)[0]} 已由 DSH 接收，模型正在回复`)
+      else if (result.status?.model) setNotice(`会话${result.status.running ? '正在运行' : '空闲'} · ${result.status.model}${result.status.effort ? ` · ${result.status.effort}` : ''}`)
+      else setNotice(`${commandText.split(/\s/, 1)[0]} 已由 DSH 确认执行`)
       return
     }
-    const attached = contextItems.map(serializeContextItem).join('')
     await onSend(`${text}${attached}`.trim())
     setContextItems([])
   }
-  const commandQuery = draft.trimStart().replace(/^\//, '').toLocaleLowerCase()
-  const visibleCommands = useMemo(() => commands.filter(command => `${command.name} ${command.description}`.toLocaleLowerCase().includes(commandQuery)), [commandQuery, commands])
+  const commandQuery = selectedCommand ? '' : draft.trimStart().replace(/^\//, '').toLocaleLowerCase()
+  const localizedCommands = useMemo(() => commands.map(localizeCommandDescriptor), [commands])
+  const visibleCommands = useMemo(() => localizedCommands.filter(command => `${command.name} ${command.description}`.toLocaleLowerCase().includes(commandQuery)), [commandQuery, localizedCommands])
   const mentionQuery = (draft.match(/(?:^|\s)@([^\s]*)$/)?.[1] ?? '').toLocaleLowerCase()
   const cardContexts = useMemo(() => {
     const seen = new Set<string>()
@@ -642,7 +857,29 @@ function NativeComposer({ sessionId, draft, setDraft, busy, fallbackModel, rpc, 
     })
     setMenu(null)
   }
-  const commandVisible = menu === 'command' || (menu === null && draft.trimStart().startsWith('/'))
+  const chooseCommand = async (command: CommandDescriptor) => {
+    setMenu('closed')
+    setDraft('')
+    if (command.name === 'model') { setSelectedCommand(null); setMenu('model'); return }
+    setSelectedCommand(command)
+    window.setTimeout(() => composer.current?.querySelector('textarea')?.focus(), 0)
+  }
+  const updateDraft = (value: string) => {
+    const claim = selectedCommand === null ? commandClaimForInput(value, commands) : null
+    if (claim?.command.input) {
+      setSelectedCommand(claim.command); setDraft(claim.remainder); setMenu('closed')
+      return
+    }
+    if (claim?.executeImmediately) {
+      void chooseCommand(claim.command)
+      return
+    }
+    setDraft(value)
+    if (value.match(/(?:^|\s)@[^\s]*$/)) setMenu('mention')
+    else if (selectedCommand === null && /^\/[^\s]*$/.test(value.trimStart())) setMenu('command')
+    else setMenu('closed')
+  }
+  const commandVisible = menu === 'command' || (menu === null && selectedCommand === null && /^\/[^\s]*$/.test(draft.trimStart()))
   const mentionVisible = menu === 'mention' || (menu === null && draft.match(/(?:^|\s)@[^\s]*$/) !== null)
   const modelMenuVisible = menu === 'model' || menu === 'models' || menu === 'effort'
   return <>
@@ -654,38 +891,46 @@ function NativeComposer({ sessionId, draft, setDraft, busy, fallbackModel, rpc, 
       {menu === 'models' && <div className="atlas-model-groups">{directory?.groups.map(group => <section key={group.id}><h4>{group.name}</h4>{group.models.map(model => { const selected = group.id === directory.current?.provider && model.id === directory.current.model; return <button type="button" role="menuitemradio" aria-checked={selected} disabled={modelBusy} key={`${group.id}:${model.id}`} onClick={() => { if (selected) { setMenu(null); return } void selectModel({ provider: group.id, model: model.id, ...(model.reasoning?.defaultEffort ? { reasoningEffort: model.reasoning.defaultEffort } : {}) }) }}><span><strong>{model.name}</strong>{model.description && <small>{model.description}</small>}</span>{selected && <Check className="size-4" />}</button>})}</section>)}</div>}
       {menu === 'effort' && <div className="atlas-model-groups">{currentChoice?.model.reasoning?.efforts.map(effort => { const selected = effort.id === currentEffort; return <button type="button" role="menuitemradio" aria-checked={selected} disabled={modelBusy} key={effort.id} onClick={() => void selectModel({ provider: currentChoice.group.id, model: currentChoice.model.id, reasoningEffort: effort.id })}><span><strong>{effort.name}</strong>{effort.description && <small>{effort.description}</small>}</span>{selected && <Check className="size-4" />}</button>})}</div>}
     </div>}
-    {menu === 'permission' && <div ref={popup} className="atlas-native-menu atlas-permission-menu" role="menu" aria-label="权限范围">{permissionError && <div className="atlas-menu-error"><span>{permissionError}</span><button type="button" onClick={() => void loadPermissions()}>重试</button></div>}{permissions?.options.map(option => { const selected = option.value === permissions.currentValue; return <button type="button" role="menuitemradio" aria-checked={selected} disabled={permissionBusy} key={option.value} onClick={() => { if (selected) { setMenu(null); return } if (option.value === 'danger-full-access') { setPermissionConfirm(option); setPermissionAcknowledged(false); setMenu(null) } else void selectPermission(option) }}><Shield className="size-4" /><span><strong>{permissionName(option.value, option.name)}</strong>{option.description && <small>{option.description}</small>}</span>{selected && <Check className="size-4" />}</button>})}{permissionBusy && <div className="atlas-menu-loading"><LoaderCircle className="size-4 animate-spin" />正在同步 DSH 权限</div>}</div>}
-    {commandVisible && <div ref={popup} className="atlas-native-menu atlas-command-help" role="menu" aria-label="DSH 命令目录">{commandError && <div className="atlas-menu-error"><span>{commandError}</span><button type="button" onClick={() => void loadCommands()}>重试</button></div>}{visibleCommands.map(command => <button type="button" role="menuitem" key={command.name} onClick={() => { if (command.name === 'model') { setDraft('/model'); setMenu('model') } else { setDraft(`/${command.name}${command.input ? ' ' : ''}`); setMenu(null) } }}><span><code>/{command.name}</code>{command.description}</span><small>{command.input?.hint ?? '执行命令'}</small></button>)}{!commandError && visibleCommands.length === 0 && <p className="atlas-menu-empty">当前 DSH Profile 没有匹配的命令</p>}</div>}
+    {menu === 'permission' && <div ref={popup} className="atlas-native-menu atlas-permission-menu" role="menu" aria-label="权限范围">{permissionError && <div className="atlas-menu-error"><span>{permissionError}</span><button type="button" onClick={() => void loadPermissions()}>重试</button></div>}{permissions?.options.map(option => { const selected = option.value === permissions.currentValue; return <button type="button" role="menuitemradio" aria-checked={selected} disabled={permissionBusy} key={option.value} onClick={() => { if (selected) { setMenu(null); return } if (option.value === 'danger-full-access') { setPermissionConfirm(option); setPermissionAcknowledged(false); setMenu(null) } else void selectPermission(option) }}><span><strong>{permissionName(option.value, option.name)}</strong>{option.description && <small>{option.description}</small>}</span>{selected && <Check className="size-4" />}</button>})}{permissionBusy && <div className="atlas-menu-loading"><LoaderCircle className="size-4 animate-spin" />正在同步 DSH 权限</div>}</div>}
+    {commandVisible && <div ref={popup} className="atlas-native-menu atlas-command-help" role="menu" aria-label="DSH 命令目录">{commandError && <div className="atlas-menu-error"><span>{commandError}</span><button type="button" onClick={() => void loadCommands()}>重试</button></div>}<div className="atlas-command-scope"><strong>作用于当前卡片所属的 DSH 会话</strong><span>点击或按空格完成选择，按发送键后才会执行</span></div>{visibleCommands.map(command => <button type="button" role="menuitem" key={command.name} onClick={() => void chooseCommand(command)}><span className="atlas-command-copy"><code>/{command.name}</code>{command.description && <small>{command.description}</small>}</span></button>)}{!commandError && visibleCommands.length === 0 && <p className="atlas-menu-empty">当前 DSH Profile 没有匹配的命令</p>}</div>}
     {mentionVisible && <div ref={popup} className="atlas-native-menu atlas-mention-menu" role="menu" aria-label="添加上下文">{contextError && <div className="atlas-menu-error"><span>{contextError}</span><button type="button" onClick={() => setContextError('')}>关闭</button></div>}<button type="button" role="menuitem" onClick={() => { setDraft(stripMention); setMenu(null); fileInput.current?.click() }}><Paperclip className="size-4" /><span><strong>选择本地文件</strong><small>PDF、Word、Excel、代码与配置文件</small></span><ChevronRight className="size-3.5" /></button><button type="button" role="menuitem" onClick={() => setMenu('history')}><MessageSquareText className="size-4" /><span><strong>对话历史</strong><small>全部或多选单独的对话卡片</small></span><ChevronRight className="size-3.5" /></button><button type="button" role="menuitem" onClick={() => setMenu('skills')}><Command className="size-4" /><span><strong>Skills</strong><small>{visibleSkills.length} 个可调用技能</small></span><ChevronRight className="size-3.5" /></button></div>}
     {menu === 'history' && <div ref={popup} className="atlas-native-menu atlas-context-picker" role="menu" aria-label="选择对话历史"><div className="atlas-menu-head"><button type="button" onClick={() => setMenu('mention')} aria-label="返回上下文分类"><ChevronLeft className="size-4" /></button><strong>对话历史</strong><button type="button" className="atlas-menu-done" onClick={finishContextSelection}>完成</button></div><div className="atlas-context-list"><button type="button" role="menuitemcheckbox" aria-checked={allCardsSelected} onClick={toggleAllCards}><span className="atlas-context-check">{allCardsSelected && <Check className="size-3" />}</span><span><strong>全部对话</strong><small>选择画布中的 {cardContexts.length} 张对话卡片</small></span></button>{cardContexts.map(item => <button type="button" role="menuitemcheckbox" aria-checked={selectedCardIds.has(item.id)} key={item.id} onClick={() => toggleCard(item)}><span className="atlas-context-check">{selectedCardIds.has(item.id) && <Check className="size-3" />}</span><span><strong>{item.label}</strong><small>{item.detail}</small></span></button>)}</div></div>}
     {menu === 'skills' && <div ref={popup} className="atlas-native-menu atlas-context-picker" role="menu" aria-label="选择 Skills"><div className="atlas-menu-head"><button type="button" onClick={() => setMenu('mention')} aria-label="返回上下文分类"><ChevronLeft className="size-4" /></button><strong>Skills</strong></div><div className="atlas-context-list">{visibleSkills.map(skill => <button type="button" role="menuitem" key={skill.name} onClick={() => chooseSkill(skill)}><Command className="size-4" /><span><strong>/{skill.name}</strong><small>{skill.description ?? 'DSH Skill'}</small></span><ChevronRight className="size-3.5" /></button>)}{visibleSkills.length === 0 && <p className="atlas-menu-empty">当前会话没有可调用的 Skill</p>}</div></div>}
     {notice && <div className="atlas-composer-notice"><span>{notice}</span><button type="button" aria-label="关闭状态" onClick={() => setNotice('')}><X className="size-3" /></button></div>}
+    {selectedCommand && <div className="atlas-command-selection"><code>/{selectedCommand.name}</code><span>{localizeCommandDescriptor(selectedCommand).description}</span><button type="button" aria-label={`移除 /${selectedCommand.name} 命令`} onClick={() => setSelectedCommand(null)}><X className="size-3" /></button></div>}
     {contextItems.length > 0 && <div className="atlas-attachment-rail" aria-label="已添加的上下文">{contextItems.map(item => <span key={item.id} title={item.detail}>{item.kind === 'card' ? <MessageSquareText className="size-3.5" /> : <FileText className="size-3.5" />}<b>{item.label}</b>{item.attachment && <small>{attachmentLabel(item.attachment.kind)}</small>}<button type="button" aria-label={`移除 ${item.label}`} onClick={() => setContextItems(value => value.filter(existing => existing.id !== item.id))}><X className="size-3" /></button></span>)}</div>}
-    <textarea className="atlas-native-input" value={draft} onChange={event => { const value = event.target.value; setDraft(value); if (value.match(/(?:^|\s)@[^\s]*$/)) setMenu('mention'); else if (value.trimStart().startsWith('/')) setMenu('command'); else setMenu(null) }} onKeyDown={event => { if (event.key === 'Escape') { setMenu(null); return } if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void submit() } }} placeholder="一起探索未至之境，输入/命令或@上下文" maxLength={16000} disabled={busy} />
-    <div className="atlas-native-footer"><div className="atlas-native-left"><button type="button" data-composer-trigger className="atlas-plus-button" onClick={() => setMenu(menu === 'command' ? null : 'command')} aria-label="打开 DSH 命令"><Plus className="size-4" /></button><button type="button" data-composer-trigger className="atlas-permission-trigger" onClick={() => setMenu(menu === 'permission' ? null : 'permission')} aria-label={`权限范围：${permissionLabel}`} aria-haspopup="menu" aria-expanded={menu === 'permission'}><Shield className="size-4" /><span>{permissionLabel}</span><ChevronDown className="size-3.5" /></button><button type="button" data-composer-trigger className="atlas-utility-button" onClick={() => { setMenu(null); fileInput.current?.click() }} title="选择本地文件" aria-label="选择本地文件"><Paperclip className="size-4" /></button><button type="button" data-composer-trigger className="atlas-utility-button" onClick={() => setMenu(menu === 'mention' ? null : 'mention')} title="添加上下文" aria-label="添加上下文"><AtSign className="size-4" /></button></div><div className="atlas-native-right"><div className="atlas-model-trigger-wrap"><button type="button" data-composer-trigger className="atlas-model-trigger" onClick={() => setMenu(modelMenuVisible ? null : 'model')} aria-label={`模型：${modelLabel}${effortLabel ? `，推理等级 ${effortLabel}` : ''}`} aria-haspopup="menu" aria-expanded={modelMenuVisible}><Bot className="size-4" /><span>{modelLabel}</span>{effortLabel && <em>{effortLabel}</em>}<ChevronDown className="size-3.5" /></button></div><button className="atlas-send-button" type="submit" disabled={busy || (!draft.trim() && contextItems.length === 0)} aria-label="发送消息">{busy ? <LoaderCircle className="size-4 animate-spin" /> : <Send className="size-4" />}</button></div></div>
+    <textarea className="atlas-native-input" value={draft} onChange={event => updateDraft(event.target.value)} onKeyDown={event => { if (event.key === 'Escape') { if ((menu !== null && menu !== 'closed') || commandVisible || mentionVisible) setMenu('closed'); else if (selectedCommand) setSelectedCommand(null); else onCancel?.(); return } if (event.key === ' ' && selectedCommand === null && !event.nativeEvent.isComposing) { const command = completedCommandLookup(draft, commands); if (command) { event.preventDefault(); void chooseCommand(command); return } } if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void submit() } }} aria-label="消息输入框" title="Enter 发送 · Shift+Enter 换行" placeholder={selectedCommand ? localizeCommandDescriptor(selectedCommand).description || '输入命令内容' : '一起探索未至之境，输入/命令或@上下文'} maxLength={16000} disabled={busy} />
+    <div className="atlas-native-footer"><div className="atlas-native-left"><button type="button" data-composer-trigger className="atlas-plus-button" onClick={() => setMenu(menu === 'command' ? 'closed' : 'command')} aria-label="打开 DSH 命令"><Plus className="size-4" /></button><button type="button" data-composer-trigger className="atlas-permission-trigger" onClick={() => setMenu(menu === 'permission' ? 'closed' : 'permission')} aria-label={`权限范围：${permissionLabel}`} aria-haspopup="menu" aria-expanded={menu === 'permission'}><Shield className="size-4" /><span>{permissionLabel}</span><ChevronDown className="size-3.5" /></button><button type="button" data-composer-trigger className="atlas-utility-button" onClick={() => { setMenu('closed'); fileInput.current?.click() }} title="选择本地文件" aria-label="选择本地文件"><Paperclip className="size-4" /></button><button type="button" data-composer-trigger className="atlas-utility-button" onClick={() => setMenu(menu === 'mention' ? 'closed' : 'mention')} title="添加上下文" aria-label="添加上下文"><AtSign className="size-4" /></button></div><div className="atlas-native-right"><div className="atlas-model-trigger-wrap"><button type="button" data-composer-trigger className="atlas-model-trigger" onClick={() => setMenu(modelMenuVisible ? 'closed' : 'model')} aria-label={`模型：${modelLabel}${effortLabel ? `，推理等级 ${effortLabel}` : ''}`} aria-haspopup="menu" aria-expanded={modelMenuVisible}><Bot className="size-4" /><span>{modelLabel}</span>{effortLabel && <em>{effortLabel}</em>}<ChevronDown className="size-3.5" /></button></div><button className="atlas-send-button" type="submit" disabled={busy || (!draft.trim() && contextItems.length === 0 && selectedCommand === null)} aria-label="发送消息" title="发送（Enter）">{busy ? <LoaderCircle className="size-4 animate-spin" /> : <Send className="size-4" />}</button></div></div>
     <input ref={fileInput} className="sr-only" type="file" multiple accept=".pdf,.docx,.xlsx,.xls,.csv,.txt,.md,.rtf,.json,.jsonc,.ts,.tsx,.js,.jsx,.mjs,.cjs,.py,.java,.go,.rs,.rb,.php,.c,.h,.cpp,.cc,.cxx,.hpp,.cs,.swift,.kt,.kts,.scala,.sh,.bash,.zsh,.ps1,.sql,.css,.scss,.less,.html,.htm,.xml,.svg,.vue,.svelte,.astro,.yaml,.yml,.toml,.ini,.cfg,.conf,.properties,.env,.graphql,.gql,.log,.lock,Dockerfile,Makefile" onChange={event => void addFiles(event.target.files)} />
   </form>
-  <Dialog open={permissionConfirm !== null} onOpenChange={value => { if (!value && !permissionBusy) setPermissionConfirm(null) }}><DialogContent className="atlas-permission-dialog"><div className="pr-7"><div className="atlas-permission-icon"><Shield className="size-5" /></div><DialogTitle className="mt-3 text-xl text-[var(--fg-2)]">启用全部权限</DialogTitle><p className="atlas-delete-intro">DSH 将允许此会话访问工作区之外的文件，并按当前审批策略执行命令。该设置会真实应用到当前会话。</p><label className="atlas-permission-confirm"><input type="checkbox" checked={permissionAcknowledged} onChange={event => setPermissionAcknowledged(event.target.checked)} /><span>我了解此权限范围，并确认继续</span></label>{permissionError && <p className="atlas-permission-dialog-error">{permissionError}</p>}<div className="atlas-delete-actions"><Button variant="outline" disabled={permissionBusy} onClick={() => setPermissionConfirm(null)}>取消</Button><Button disabled={permissionBusy || !permissionAcknowledged} onClick={() => { if (permissionConfirm) void selectPermission(permissionConfirm).then(changed => { if (changed) setPermissionConfirm(null) }) }}>{permissionBusy ? <LoaderCircle className="size-4 animate-spin" /> : <Shield className="size-4" />}确认全部权限</Button></div></div></DialogContent></Dialog>
+  <Dialog open={permissionConfirm !== null} onOpenChange={value => { if (!value && !permissionBusy) setPermissionConfirm(null) }}><DialogContent className="atlas-permission-dialog"><div className="pr-7"><DialogTitle className="text-lg text-[var(--fg-2)]">启用全部权限</DialogTitle><p className="atlas-delete-intro">允许当前会话访问工作区之外的文件，并按现有审批策略执行命令。</p><label className="atlas-permission-confirm"><input type="checkbox" checked={permissionAcknowledged} onChange={event => setPermissionAcknowledged(event.target.checked)} /><span>我了解此权限范围，并确认继续</span></label>{permissionError && <p className="atlas-permission-dialog-error">{permissionError}</p>}<div className="atlas-delete-actions"><Button variant="outline" disabled={permissionBusy} onClick={() => setPermissionConfirm(null)}>取消</Button><Button disabled={permissionBusy || !permissionAcknowledged} onClick={() => { if (permissionConfirm) void selectPermission(permissionConfirm).then(changed => { if (changed) setPermissionConfirm(null) }) }}>{permissionBusy ? <LoaderCircle className="size-4 animate-spin" /> : null}确认全部权限</Button></div></div></DialogContent></Dialog>
   </>
 }
 
-function DraftCardView({ compose, point, draft, setDraft, busy, fallbackModel, rpc, contextCards, onCancel, onSubmit, onCommand }: { compose: Compose; point: Point; draft: string; setDraft: (value: string | ((previous: string) => string)) => void; busy: boolean; fallbackModel: string; rpc: (type: string, body?: object) => Promise<unknown>; contextCards: Card[]; onCancel: () => void; onSubmit: (text: string) => Promise<void>; onCommand: (line: string) => Promise<unknown> }) {
+function DraftCardView({ compose, point, projected, live, activity, draft, setDraft, busy, fallbackModel, rpc, contextCards, onCancel, onSubmit, onCommand }: { compose: Compose; point: Point; projected?: Card; live?: string; activity?: LiveActivity; draft: string; setDraft: (value: string | ((previous: string) => string)) => void; busy: boolean; fallbackModel: string; rpc: (type: string, body?: object) => Promise<unknown>; contextCards: Card[]; onCancel: () => void; onSubmit: (text: string) => Promise<void>; onCommand: (line: string) => Promise<unknown> }) {
   const isNew = compose.kind === 'new'
   const sourceCard = isNew ? contextCards[0] : compose.card
-  return <article data-card data-compose-draft className="atlas-card atlas-draft-card" style={{ left: point.x, top: point.y, width: DEFAULT_CARD_SIZE.width, minHeight: DEFAULT_CARD_SIZE.height }} aria-label={isNew ? '新对话草稿' : compose.kind === 'branch' ? '新分支草稿' : '新追问草稿'}>
-    <header><div className="flex items-center gap-2"><span className="atlas-card-dot" /><Badge>{isNew ? '新对话' : compose.kind === 'branch' ? '新的分支' : '新的追问'}</Badge></div><button type="button" className="atlas-draft-cancel" onClick={onCancel} disabled={busy} aria-label="取消草稿"><X className="size-4" /></button></header>
-    {isNew ? <form className="atlas-inline-new-form" onSubmit={event => { event.preventDefault(); void onSubmit(draft) }}><textarea autoFocus value={draft} onChange={event => setDraft(event.target.value)} placeholder="输入第一条消息" maxLength={4000} disabled={busy} /><div><span>将在当前 DSH 工作区创建会话</span><Button size="sm" type="submit" disabled={busy || !draft.trim()}>{busy ? <LoaderCircle className="size-4 animate-spin" /> : <Send className="size-4" />}开始</Button></div></form> : sourceCard && <NativeComposer sessionId={sourceCard.sessionId} draft={draft} setDraft={setDraft} busy={busy} fallbackModel={fallbackModel} rpc={rpc} contextCards={contextCards} sourceCard={sourceCard} onSend={onSubmit} onCommand={onCommand} />}
+  const submitted = compose.submission
+  const visibleText = live?.trim() || projected?.summary?.trim() || ''
+  const visibleActivity = activity ?? (submitted?.phase === 'accepted'
+    ? { kind: 'thinking', status: 'running', label: '消息已提交，正在等待模型响应' } as LiveActivity
+    : { kind: 'thinking', status: 'running', label: '正在提交消息' } as LiveActivity)
+  return <article data-card data-compose-draft className={`atlas-card atlas-draft-card ${submitted ? 'is-submitted' : ''}`} style={{ left: point.x, top: point.y, width: DEFAULT_CARD_SIZE.width, minHeight: DEFAULT_CARD_SIZE.height }} aria-label={submitted ? '正在生成回答的对话卡片' : isNew ? '新对话草稿' : compose.kind === 'branch' ? '新分支草稿' : '新追问草稿'}>
+    <header><div className="flex items-center gap-2"><span className="atlas-card-dot" /><Badge>{isNew ? '新对话' : compose.kind === 'branch' ? '新的分支' : '新的追问'}</Badge></div>{!submitted && <button type="button" className="atlas-draft-cancel" onClick={onCancel} disabled={busy} aria-label="取消草稿"><X className="size-4" /></button>}</header>
+    {submitted ? <><h3 title={submitted.text}>{previewText(submitted.text)}</h3><LiveActivityLine activity={visibleActivity} />{visibleText && <div className="atlas-card-summary" title={visibleText}>{previewText(visibleText)}</div>}</> : isNew ? <form className="atlas-inline-new-form" onSubmit={event => { event.preventDefault(); void onSubmit(draft) }}><textarea autoFocus value={draft} onChange={event => setDraft(event.target.value)} onKeyDown={event => { if (event.key === 'Escape') { event.preventDefault(); onCancel(); return } if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void onSubmit(draft) } }} aria-label="输入第一条消息" title="Enter 发送 · Shift+Enter 换行" placeholder="输入第一条消息" maxLength={4000} disabled={busy} /><div><span>Enter 发送 · Shift+Enter 换行</span><Button size="sm" type="submit" title="发送（Enter）" disabled={busy || !draft.trim()}>{busy ? <LoaderCircle className="size-4 animate-spin" /> : <Send className="size-4" />}开始</Button></div></form> : sourceCard && <NativeComposer sessionId={sourceCard.sessionId} draft={draft} setDraft={setDraft} busy={busy} fallbackModel={fallbackModel} rpc={rpc} contextCards={contextCards} sourceCard={sourceCard} onSend={onSubmit} onCommand={onCommand} onCancel={onCancel} />}
   </article>
 }
 
-function CardView({ card, point, active, deleting, matched, live, childCount, collapsed, canContinue, menuOpen, onMenuOpenChange, draft, setDraft, busy, fallbackModel, rpc, contextCards, onOpen, onDrag, onResize, onContinue, onBranch, onSend, onCommand, onOpenDsh, onArchive, onDelete, onMarker, onToggle }: { card: Card; point: Point; active: boolean; deleting: boolean; matched: boolean; live?: string; childCount: number; collapsed: boolean; canContinue: boolean; menuOpen: boolean; onMenuOpenChange: (open: boolean) => void; draft: string; setDraft: (value: string | ((previous: string) => string)) => void; busy: boolean; fallbackModel: string; rpc: (type: string, body?: object) => Promise<unknown>; contextCards: Card[]; onOpen: () => void; onDrag: (event: React.PointerEvent<HTMLElement>) => void; onResize: (event: React.PointerEvent<HTMLElement>, edge: ResizeEdge) => void; onContinue: () => void; onBranch: () => void; onSend: (text: string) => Promise<void>; onCommand: (line: string) => Promise<unknown>; onOpenDsh: () => void; onArchive: () => void; onDelete: () => void; onMarker: (marker: Marker) => void; onToggle: () => void }) {
+function CardView({ card, point, active, deleting, matched, live, activity, childCount, collapsed, canContinue, menuOpen, onMenuOpenChange, draft, setDraft, busy, fallbackModel, rpc, contextCards, onOpen, onDrag, onResize, onContinue, onBranch, onSend, onCommand, onOpenDsh, onArchive, onDelete, onMarker, onToggle }: { card: Card; point: Point; active: boolean; deleting: boolean; matched: boolean; live?: string; activity?: LiveActivity; childCount: number; collapsed: boolean; canContinue: boolean; menuOpen: boolean; onMenuOpenChange: (open: boolean) => void; draft: string; setDraft: (value: string | ((previous: string) => string)) => void; busy: boolean; fallbackModel: string; rpc: (type: string, body?: object) => Promise<unknown>; contextCards: Card[]; onOpen: () => void; onDrag: (event: React.PointerEvent<HTMLElement>) => void; onResize: (event: React.PointerEvent<HTMLElement>, edge: ResizeEdge) => void; onContinue: () => void; onBranch: () => void; onSend: (text: string) => Promise<void>; onCommand: (line: string) => Promise<unknown>; onOpenDsh: () => void; onArchive: () => void; onDelete: () => void; onMarker: (marker: Marker) => void; onToggle: () => void }) {
   const choose = (marker: Marker) => onMarker(marker)
   const canBranch = Number.isInteger(card.branchSeq)
   const isFreshConversation = card.sourceSeq === null && card.messages.length === 0
   const fileCount = cardAttachmentCount(card)
   const size = cardSize(card) as CardSize
   const title = previewText(card.title)
-  const summary = previewText(live?.trim() || card.summary)
+  const visibleActivity = activity && shouldShowLiveActivity(card, activity) ? activity : undefined
+  const summarySource = live?.trim() || (visibleActivity ? '' : card.summary)
+  const summary = summarySource ? previewText(summarySource) : ''
   const edgeAt = (event: React.PointerEvent<HTMLElement>): ResizeEdge | null => {
     if ((event.target as HTMLElement).closest('button, a, input, textarea, select, [data-no-drag]')) return null
     const rect = event.currentTarget.getBoundingClientRect(); const threshold = 11
@@ -693,12 +938,20 @@ function CardView({ card, point, active, deleting, matched, live, childCount, co
     return edge.left || edge.right || edge.top || edge.bottom ? edge : null
   }
   const cursorFor = (edge: ResizeEdge | null) => edge === null ? 'grab' : (edge.left || edge.right) && (edge.top || edge.bottom) ? 'nwse-resize' : edge.left || edge.right ? 'ew-resize' : 'ns-resize'
-  return <article data-card data-card-id={card.id} className={`atlas-card ${isFreshConversation ? 'is-fresh-conversation' : ''} ${active ? 'is-active' : ''} ${card.parentSessionId ? 'is-branch' : ''} ${deleting ? 'is-delete-preview' : ''} ${matched ? 'is-search-match' : ''}`} style={{ left: point.x, top: point.y, width: size.width, height: size.height }} onPointerDown={event => { const edge = edgeAt(event); if (edge) onResize(event, edge); else onDrag(event) }} onPointerMove={event => { event.currentTarget.style.cursor = cursorFor(edgeAt(event)) }} onPointerLeave={event => { event.currentTarget.style.cursor = 'grab' }} onClick={event => { if (!(event.target as HTMLElement).closest('button, a, input, textarea, select, [data-no-drag]')) onOpen() }} title="拖动卡片移动；拖动边框可调整大小">
-    {canContinue && <button className="atlas-card-connector atlas-card-continue" onClick={event => { event.stopPropagation(); onContinue() }} aria-label="添加追问" title="添加追问"><Plus className="size-3.5" /></button>}
-    {!canContinue && childCount > 0 && <button className="atlas-card-connector atlas-card-fold" onClick={event => { event.stopPropagation(); onToggle() }} aria-label={collapsed ? `展开 ${childCount} 个后续节点` : `折叠 ${childCount} 个后续节点`} title={collapsed ? '展开后续对话' : '折叠后续对话'}>{collapsed ? <CirclePlus className="size-3.5" /> : <CircleMinus className="size-3.5" />}</button>}
-    {canBranch && <button className="atlas-card-connector atlas-card-branch" onClick={event => { event.stopPropagation(); onBranch() }} aria-label="从此回答创建分支" title="从此回答创建分支"><GitBranch className="size-3.5" /></button>}
-    <header><div className="flex items-center gap-2"><span className="atlas-card-dot" /><Badge>{isFreshConversation ? '新对话' : card.parentSessionId ? '另一种思路' : '对话'}</Badge>{card.marker.important && <span className="atlas-marker-chip">重点</span>}{card.marker.kind !== 'none' && <span className={`atlas-marker-chip is-${card.marker.kind}`}>{markerLabel(card.marker.kind)}</span>}</div><div className="atlas-card-menu-wrap" data-no-drag><button className="atlas-card-menu-trigger" onClick={event => { event.stopPropagation(); onMenuOpenChange(!menuOpen) }} aria-label={`打开 ${card.title} 的卡片菜单`} aria-expanded={menuOpen} title="卡片状态"><MoreHorizontal className="size-4" /></button>{menuOpen && <div className="atlas-card-menu atlas-card-status-menu" role="menu"><div className="atlas-card-menu-label">卡片状态</div><button role="menuitemcheckbox" aria-checked={card.marker.important} onClick={event => { event.stopPropagation(); choose({ ...card.marker, important: !card.marker.important }) }}><Check className={`size-3.5 ${card.marker.important ? '' : 'invisible'}`} />重点</button>{(['conclusion', 'verify'] as MarkerKind[]).map(kind => <button key={kind} role="menuitemcheckbox" aria-checked={card.marker.kind === kind} onClick={event => { event.stopPropagation(); choose({ ...card.marker, kind: card.marker.kind === kind ? 'none' : kind }) }}><Check className={`size-3.5 ${card.marker.kind === kind ? '' : 'invisible'}`} />{markerLabel(kind)}</button>)}<button role="menuitem" className="is-danger" onClick={event => { event.stopPropagation(); onMenuOpenChange(false); onDelete() }}><Trash2 className="size-3.5" />删除卡片</button></div>}</div></header>{isFreshConversation ? <div className="atlas-fresh-conversation" data-no-drag><h3>开始新对话</h3><p>输入消息以开始当前会话</p><NativeComposer sessionId={card.sessionId} draft={draft} setDraft={setDraft} busy={busy} fallbackModel={fallbackModel} rpc={rpc} contextCards={contextCards} sourceCard={card} onSend={onSend} onCommand={onCommand} /></div> : <><h3 title={card.title}>{title}</h3><div className="atlas-card-summary" title={live?.trim() || card.summary}>{summary}</div><footer className="atlas-card-footer"><span>{fileCount > 0 && <><FileText className="size-3.5" />{fileCount}</>}{card.tools > 0 && <>{fileCount > 0 && ' · '}<Wrench className="size-3.5" />{card.tools}</>}{card.todos > 0 && ` · 待办 ${card.todos}`}</span><div className="atlas-card-actions"><button onClick={event => { event.stopPropagation(); onOpen() }}>查看详情</button><button onClick={event => { event.stopPropagation(); onOpenDsh() }}>返回 DSH</button><button onClick={event => { event.stopPropagation(); onArchive() }}>存档</button></div></footer><CardMetricsBar metrics={card.metrics} /></>}
+  return <article data-card data-card-id={card.id} className={`atlas-card ${isFreshConversation ? 'is-fresh-conversation' : ''} ${active ? 'is-active' : ''} ${card.parentSessionId ? 'is-branch' : ''} ${deleting ? 'is-delete-preview' : ''} ${matched ? 'is-search-match' : ''}`} style={{ left: point.x, top: point.y, width: size.width, height: size.height }} onPointerDown={event => { if ((event.target as HTMLElement).closest('button, a, input, textarea, select, [data-no-drag]')) return; const edge = edgeAt(event); if (edge) onResize(event, edge); else onDrag(event) }} onPointerMove={event => { event.currentTarget.style.cursor = cursorFor(edgeAt(event)) }} onPointerLeave={event => { event.currentTarget.style.cursor = 'grab' }} onClick={event => { if (!(event.target as HTMLElement).closest('button, a, input, textarea, select, [data-no-drag]')) onOpen() }} title="拖动卡片移动；拖动边框可调整大小">
+    {canContinue && <button className="atlas-card-connector atlas-card-continue" onPointerDown={event => event.stopPropagation()} onClick={event => { event.stopPropagation(); onContinue() }} aria-label="添加追问" title="添加追问"><Plus className="size-3.5" /></button>}
+    {!canContinue && childCount > 0 && <button className="atlas-card-connector atlas-card-fold" onPointerDown={event => event.stopPropagation()} onClick={event => { event.stopPropagation(); onToggle() }} aria-label={collapsed ? `展开 ${childCount} 个后续节点` : `折叠 ${childCount} 个后续节点`} title={collapsed ? '展开后续对话' : '折叠后续对话'}>{collapsed ? <CirclePlus className="size-3.5" /> : <CircleMinus className="size-3.5" />}</button>}
+    {canBranch && <button className="atlas-card-connector atlas-card-branch" onPointerDown={event => event.stopPropagation()} onClick={event => { event.stopPropagation(); onBranch() }} aria-label="从此回答创建分支" title="从此回答创建分支"><GitBranch className="size-3.5" /></button>}
+    <header><div className="flex items-center gap-2"><span className="atlas-card-dot" /><Badge>{isFreshConversation ? '新对话' : card.parentSessionId ? '另一种思路' : '对话'}</Badge>{card.marker.important && <span className="atlas-marker-chip">重点</span>}{card.marker.kind !== 'none' && <span className={`atlas-marker-chip is-${card.marker.kind}`}>{markerLabel(card.marker.kind)}</span>}</div><div className="atlas-card-menu-wrap" data-no-drag><button className="atlas-card-menu-trigger" onClick={event => { event.stopPropagation(); onMenuOpenChange(!menuOpen) }} aria-label={`打开 ${card.title} 的卡片菜单`} aria-expanded={menuOpen} title="卡片状态"><MoreHorizontal className="size-4" /></button>{menuOpen && <div className="atlas-card-menu atlas-card-status-menu" role="menu"><div className="atlas-card-menu-label">卡片状态</div><button role="menuitemcheckbox" aria-checked={card.marker.important} onClick={event => { event.stopPropagation(); choose({ ...card.marker, important: !card.marker.important }) }}><Check className={`size-3.5 ${card.marker.important ? '' : 'invisible'}`} />重点</button>{(['conclusion', 'verify'] as MarkerKind[]).map(kind => <button key={kind} role="menuitemcheckbox" aria-checked={card.marker.kind === kind} onClick={event => { event.stopPropagation(); choose({ ...card.marker, kind: card.marker.kind === kind ? 'none' : kind }) }}><Check className={`size-3.5 ${card.marker.kind === kind ? '' : 'invisible'}`} />{markerLabel(kind)}</button>)}<button role="menuitem" className="is-danger" onClick={event => { event.stopPropagation(); onMenuOpenChange(false); onDelete() }}><Trash2 className="size-3.5" />删除卡片</button></div>}</div></header>{isFreshConversation ? <div className="atlas-fresh-conversation" data-no-drag><h3>开始新对话</h3><p>输入消息以开始当前会话</p><NativeComposer sessionId={card.sessionId} draft={draft} setDraft={setDraft} busy={busy} fallbackModel={fallbackModel} rpc={rpc} contextCards={contextCards} sourceCard={card} onSend={onSend} onCommand={onCommand} /></div> : <><h3 title={card.title}>{title}</h3>{visibleActivity && <LiveActivityLine activity={visibleActivity} />}{summary && <div className="atlas-card-summary" title={live?.trim() || card.summary}>{summary}</div>}<footer className="atlas-card-footer"><span>{fileCount > 0 && <><FileText className="size-3.5" />{fileCount}</>}{card.tools > 0 && <>{fileCount > 0 && ' · '}<Wrench className="size-3.5" />{card.tools}</>}{card.todos > 0 && ` · 待办 ${card.todos}`}</span><div className="atlas-card-actions"><button onClick={event => { event.stopPropagation(); onOpen() }}>查看详情</button><button onClick={event => { event.stopPropagation(); onOpenDsh() }}>返回 DSH</button><button onClick={event => { event.stopPropagation(); onArchive() }}>存档</button></div></footer><CardMetricsBar metrics={card.metrics} /></>}
   </article>
+}
+function LiveActivityLine({ activity, prefix }: { activity: LiveActivity; prefix?: string }) {
+  return <div className={`atlas-live-activity is-${activity.kind} is-${activity.status}`} role="status" aria-live="polite" title={activity.label}>{activity.status === 'running' ? <LoaderCircle className="size-3.5 animate-spin" /> : <Check className="size-3.5" />}<span>{prefix ? `${prefix} · ${activity.label}` : activity.label}</span></div>
+}
+function isLiveArtifactActivity(activity?: LiveActivity) { return activity?.kind === 'tool' && /render_artifact|render_html/i.test(activity.label) }
+function shouldShowLiveActivity(card: Card | null, activity: LiveActivity) {
+  if (!card) return true
+  return !cardHasSettledReply(card)
 }
 function CardMetricsBar({ metrics }: { metrics?: CardMetrics | null }) {
   if (!metrics) return null
@@ -714,11 +967,12 @@ function CardMetricsBar({ metrics }: { metrics?: CardMetrics | null }) {
 }
 function SessionNav({ node, activeSession, canvasRoot, expanded, onToggle, onSelect, selectionMode, selectedSessionIds, onSelectForDelete, depth = 0 }: { node: SessionNode; activeSession: string; canvasRoot: string; expanded: Set<string>; onToggle: (id: string) => void; onSelect: (card: Card) => void; selectionMode: boolean; selectedSessionIds: Set<string>; onSelectForDelete: (id: string) => void; depth?: number }) {
   const isExpanded = expanded.has(node.id)
+  const sessionTitle = node.card.sessionTitle || node.card.title
   return <div className={`atlas-session-node ${depth > 0 ? 'is-branch' : ''}`}>
     <div className={`atlas-session-row ${node.children.length === 0 ? 'is-leaf' : ''} ${selectionMode ? 'is-selecting' : ''}`}>
-      {selectionMode && <input className="atlas-session-checkbox" type="checkbox" checked={selectedSessionIds.has(node.id)} onChange={() => onSelectForDelete(node.id)} onClick={event => event.stopPropagation()} aria-label={`选择 ${node.card.title}`} />}
-      {node.children.length > 0 && <button className="atlas-session-toggle" onClick={() => onToggle(node.id)} aria-label={isExpanded ? `收起 ${node.card.title} 的分支` : `展开 ${node.card.title} 的分支`} aria-expanded={isExpanded}>{isExpanded ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}</button>}
-      <button className={`atlas-session-title-button ${node.id === activeSession ? 'is-active' : ''} ${node.id === canvasRoot ? 'is-canvas-root' : ''}`} onClick={() => selectionMode ? onSelectForDelete(node.id) : onSelect(node.card)} title={node.card.title}>{depth > 0 && <span className="atlas-branch-badge">分支</span>}<span className="atlas-session-title truncate">{node.card.title}</span></button>
+      {selectionMode && <input className="atlas-session-checkbox" type="checkbox" checked={selectedSessionIds.has(node.id)} onChange={() => onSelectForDelete(node.id)} onClick={event => event.stopPropagation()} aria-label={`选择 ${sessionTitle}`} />}
+      {node.children.length > 0 && <button className="atlas-session-toggle" onClick={() => onToggle(node.id)} aria-label={isExpanded ? `收起 ${sessionTitle} 的分支` : `展开 ${sessionTitle} 的分支`} aria-expanded={isExpanded}>{isExpanded ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}</button>}
+      <button className={`atlas-session-title-button ${node.id === activeSession ? 'is-active' : ''} ${node.id === canvasRoot ? 'is-canvas-root' : ''}`} onClick={() => selectionMode ? onSelectForDelete(node.id) : onSelect(node.card)} title={sessionTitle}>{depth > 0 && <span className="atlas-branch-badge">分支</span>}<span className="atlas-session-title truncate">{sessionTitle}</span></button>
     </div>
     {isExpanded && node.children.length > 0 && <div className="atlas-session-children">{node.children.map(child => <SessionNav key={child.id} node={child} activeSession={activeSession} canvasRoot={canvasRoot} expanded={expanded} onToggle={onToggle} onSelect={onSelect} selectionMode={selectionMode} selectedSessionIds={selectedSessionIds} onSelectForDelete={onSelectForDelete} depth={depth + 1} />)}</div>}
   </div>
@@ -726,9 +980,11 @@ function SessionNav({ node, activeSession, canvasRoot, expanded, onToggle, onSel
 function MarkdownText({ text, compact = false }: { text: string; compact?: boolean }) { return <div className={`atlas-markdown ${compact ? 'is-compact' : ''}`}><ReactMarkdown remarkPlugins={[remarkGfm]} components={{ a: props => <a {...props} target="_blank" rel="noreferrer" /> }}>{text}</ReactMarkdown></div> }
 function MessageView({ message, dark }: { message: Message; dark: boolean }) {
   const artifacts = message.process.filter(isArtifact)
+  const leadingArtifacts = artifacts.filter(item => Number.isSafeInteger(item.sourceSeq) && item.sourceSeq! < message.sourceSeq)
+  const trailingArtifacts = artifacts.filter(item => !leadingArtifacts.includes(item))
   const tools = message.process.filter(item => !isArtifact(item))
   const attachmentMessage = splitAttachmentMessage(message.text)
-  return <div className={`atlas-detail-message is-${message.kind}`}><span>{message.kind === 'user' ? '你的消息' : message.kind === 'assistant' ? 'DSH' : message.kind === 'todo' ? '待办' : '系统'}</span>{attachmentMessage.body && <MarkdownText text={attachmentMessage.body} />}{attachmentMessage.attachments.length > 0 && <AttachmentList attachments={attachmentMessage.attachments} />}{artifacts.map(item => <ArtifactView key={item.callId} item={item} dark={dark} />)}{tools.length > 0 && <details className="atlas-process-group"><summary>{tools.length} 次工具活动</summary><div>{tools.map(item => <details key={item.callId} className="atlas-process"><summary>{item.name} · {item.error ? '失败' : item.result === null ? '进行中' : '已完成'}</summary>{item.arguments && <pre>{item.arguments}</pre>}{item.result && <pre>{item.result}</pre>}{item.error && <pre>{item.error}</pre>}</details>)}</div></details>}</div>
+  return <div className={`atlas-detail-message is-${message.kind}`}><span>{message.kind === 'user' ? '你的消息' : message.kind === 'assistant' ? 'DSH' : message.kind === 'todo' ? '待办' : '系统'}</span>{leadingArtifacts.map(item => <ArtifactView key={item.callId} item={item} dark={dark} />)}{attachmentMessage.body && <MarkdownText text={attachmentMessage.body} />}{attachmentMessage.attachments.length > 0 && <AttachmentList attachments={attachmentMessage.attachments} />}{trailingArtifacts.map(item => <ArtifactView key={item.callId} item={item} dark={dark} />)}{tools.length > 0 && <details className="atlas-process-group"><summary>{tools.length} 次工具活动</summary><div>{tools.map(item => <details key={item.callId} className="atlas-process"><summary>{item.name} · {item.error ? '失败' : item.result === null ? '进行中' : '已完成'}</summary>{item.arguments && <pre>{item.arguments}</pre>}{item.result && <pre>{item.result}</pre>}{item.error && <pre>{item.error}</pre>}</details>)}</div></details>}</div>
 }
 function AttachmentList({ attachments }: { attachments: FileAttachment[] }) {
   return <div className="atlas-message-attachments" aria-label="本条消息附带的文件">{attachments.map((attachment, index) => <div key={`${attachment.name}-${index}`}><FileText className="size-4" /><span><strong>{attachment.name}</strong><small>{attachmentLabel(attachment.kind)} · {attachment.size > 0 ? formatBytes(attachment.size) : '已提取正文'}{attachment.truncated ? ' · 正文已截取' : ''}</small></span></div>)}</div>
@@ -746,17 +1002,17 @@ function ArtifactView({ item, dark }: { item: Process; dark: boolean }) {
   if (item.name === 'render_html' && html) return <section className="atlas-artifact"><header>{title ?? 'HTML 画布'}</header><iframe sandbox="allow-scripts" title={title ?? 'HTML 画布'} srcDoc={sandboxHtml(html)} style={{ height: artifactHeight(height, 400) }} /></section>
   if (item.name !== 'render_artifact') return null
   const code = typeof args.code === 'string' ? args.code : meta.engine === 'mermaid' && typeof meta.payload === 'string' ? meta.payload : ''
-  return <section className="atlas-artifact"><header>{title ?? (engine === 'mermaid' ? 'Mermaid 图表' : engine === 'three' ? '3D 场景' : 'ECharts 图表')}</header>{engine === 'mermaid' ? <MermaidArtifact code={code} dark={dark} height={artifactHeight(height, 360)} /> : engine === 'three' ? <ThreeArtifact spec={spec} dark={dark} height={artifactHeight(height, 400)} /> : <EchartsArtifact option={option} maps={maps} dark={dark} height={artifactHeight(height, 360)} />}</section>
+  return <section className="atlas-artifact"><header>{title ?? (engine === 'mermaid' ? 'Mermaid 图表' : engine === 'three' ? '3D 场景' : 'ECharts 图表')}</header>{engine === 'mermaid' ? <MermaidArtifact code={code} dark={dark} /> : engine === 'three' ? <ThreeArtifact spec={spec} dark={dark} height={artifactHeight(height, 400)} /> : <EchartsArtifact option={option} maps={maps} dark={dark} height={artifactHeight(height, 360)} />}</section>
 }
 function EchartsArtifact({ option, maps, dark, height }: { option: Record<string, unknown> | null; maps: Record<string, unknown> | null; dark: boolean; height: number }) {
   const container = useRef<HTMLDivElement>(null)
   useEffect(() => { let disposed = false; let chart: { dispose: () => void; setOption: (value: unknown) => void } | null = null; void loadGlobalScript('/plugins/dsh-artifact/assets/echarts.min.js', 'echarts').then(async api => { if (!container.current || disposed || !option) return; if (usesEchartsGl(option)) await loadGlobalScript('/plugins/dsh-artifact/assets/echarts-gl.min.js', 'echarts', true); if (maps) for (const [name, value] of Object.entries(maps)) api.registerMap?.(name, value); const created = api.init(container.current, dark ? 'dark' : undefined) as { dispose: () => void; setOption: (value: unknown) => void }; chart = created; created.setOption(option) }).catch(error => { if (container.current) container.current.textContent = `图表加载失败：${error instanceof Error ? error.message : String(error)}` }); return () => { disposed = true; chart?.dispose() } }, [dark, maps, option])
   return <div ref={container} className="atlas-artifact-canvas" style={{ height }} />
 }
-function MermaidArtifact({ code, dark, height }: { code: string; dark: boolean; height: number }) {
+function MermaidArtifact({ code, dark }: { code: string; dark: boolean }) {
   const container = useRef<HTMLDivElement>(null)
   useEffect(() => { let disposed = false; void loadGlobalScript('/plugins/dsh-artifact/assets/mermaid.min.js', 'mermaid').then(async api => { if (!container.current || disposed || !code) return; api.initialize({ startOnLoad: false, securityLevel: 'strict', theme: dark ? 'dark' : 'default' }); const result = await api.render(`atlas-mermaid-${crypto.randomUUID()}`, code); if (!disposed && container.current) container.current.innerHTML = result.svg }).catch(error => { if (container.current) container.current.textContent = `图表加载失败：${error instanceof Error ? error.message : String(error)}` }); return () => { disposed = true; if (container.current) container.current.innerHTML = '' } }, [code, dark])
-  return <div ref={container} className="atlas-artifact-canvas is-mermaid" style={{ height }} />
+  return <div ref={container} className="atlas-artifact-canvas is-mermaid" />
 }
 function ThreeArtifact({ spec, dark, height }: { spec: Record<string, unknown> | null; dark: boolean; height: number }) {
   const container = useRef<HTMLDivElement>(null)
@@ -891,7 +1147,13 @@ function connectorPath(from: Point, to: Point, branch: boolean, fromSize: CardSi
 }
 async function savePosition(id: string, position: Point) { await fetch(`/atlas/api/cards/${encodeURIComponent(id)}/position`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ position }) }).catch(() => {}) }
 async function saveCardSize(id: string, size: CardSize) { await fetch(`/atlas/api/cards/${encodeURIComponent(id)}/size`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ size }) }).catch(() => {}) }
-function without(record: Record<string, string>, id: string) { const next = { ...record }; delete next[id]; return next }
+function without<T>(record: Record<string, T>, id: string) { const next = { ...record }; delete next[id]; return next }
+function normalizeLiveActivity(value: unknown): LiveActivity | null {
+  if (!value || typeof value !== 'object') return null
+  const candidate = value as { kind?: unknown; status?: unknown; label?: unknown }
+  if (!['thinking', 'tool', 'reply'].includes(String(candidate.kind)) || !['running', 'completed'].includes(String(candidate.status)) || typeof candidate.label !== 'string' || candidate.label.trim() === '') return null
+  return { kind: candidate.kind as LiveActivity['kind'], status: candidate.status as LiveActivity['status'], label: candidate.label.trim().slice(0, 160) }
+}
 function finite(value: unknown, fallback: number) { return Number.isFinite(Number(value)) ? Number(value) : fallback }
 function finiteMetric(value: unknown): value is number { return typeof value === 'number' && Number.isFinite(value) && value >= 0 }
 function formatMetricDuration(ms: number) { const seconds = ms / 1000; return `${seconds < 1 ? Math.round(seconds * 100) / 100 : Math.round(seconds * 10) / 10}s` }

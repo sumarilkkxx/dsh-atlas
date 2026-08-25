@@ -52,6 +52,10 @@ export function apply(ctx, config = {}) {
       if (path === '/atlas/api/conversations' && req.method === 'GET') return sendJson(res, 200, await store.conversationCards(new URL(req.url ?? '/', 'http://atlas.local').searchParams.get('cwd') ?? undefined))
       if (path === '/atlas/api/workspaces' && req.method === 'GET') return sendJson(res, 200, { workspaces: (await store.graph()).workspaces })
       if (path === '/atlas/api/sessions/sync' && req.method === 'POST') { const body = await readJson(req); return sendJson(res, 200, await store.syncSessions(body.sessions, body.removedSessionIds)) }
+      const commandExecution = /^\/atlas\/api\/sessions\/([^/]+)\/commands$/.exec(path)
+      if (commandExecution !== null && req.method === 'POST') return sendJson(res, 201, { command: await store.recordCommandExecution(decodeURIComponent(commandExecution[1]), await readJson(req)) })
+      const commandUpdate = /^\/atlas\/api\/sessions\/([^/]+)\/commands\/([^/]+)$/.exec(path)
+      if (commandUpdate !== null && req.method === 'PATCH') return sendJson(res, 200, { command: await store.updateCommandExecution(decodeURIComponent(commandUpdate[1]), decodeURIComponent(commandUpdate[2]), await readJson(req)) })
       const summary = /^\/atlas\/api\/conversations\/([^/]+)\/summary$/.exec(path)
       if (summary !== null && req.method === 'GET') return sendJson(res, 200, { summary: await store.conversationSummary(decodeURIComponent(summary[1])) })
       if (summary !== null && req.method === 'PUT') return sendJson(res, 200, { summary: await store.saveConversationSummary(decodeURIComponent(summary[1]), await readJson(req)) })
@@ -147,7 +151,7 @@ function hostnameOf(authority) {
   return (value.match(/:/g)?.length ?? 0) <= 1 ? value.replace(/:\d+$/, '') : value
 }
 function sessionIdForCard(id) {
-  const match = /^(.*):(?:turn:\d+|session)$/.exec(id)
+  const match = /^(.*):(?:turn:\d+|command:\d+|session)$/.exec(id)
   return match?.[1] ?? id
 }
 async function generateConversationSummary(llm, rootSessionId, body) {
